@@ -96,3 +96,4 @@ tempfile.workspace = true
 [features]
 default = []
 test-utils = ["reth-db/test-utils"]
+i-wanna-go-fast = ["reth-engine-service/i-wanna-go-fast"]
