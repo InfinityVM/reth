@@ -43,3 +43,6 @@ reth-chainspec.workspace = true
 
 tokio = { workspace = true, features = ["sync"] }
 tokio-stream.workspace = true
+
+[features]
+i-wanna-go-fast = ["reth-engine-tree/i-wanna-go-fast"]

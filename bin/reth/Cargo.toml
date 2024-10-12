@@ -100,7 +100,7 @@ reth-discv4.workspace = true
 tempfile.workspace = true
 
 [features]
-default = ["jemalloc"]
+default = ["jemalloc", "i-wanna-go-fast"]
 
 dev = ["reth-cli-commands/dev"]
 
@@ -119,6 +119,8 @@ min-warn-logs = ["tracing/release_max_level_warn"]
 min-info-logs = ["tracing/release_max_level_info"]
 min-debug-logs = ["tracing/release_max_level_debug"]
 min-trace-logs = ["tracing/release_max_level_trace"]
+
+i-wanna-go-fast = ["reth-node-builder/i-wanna-go-fast"]
 
 [[bin]]
 name = "reth"
