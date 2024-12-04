@@ -1,13 +1,17 @@
 //! System contract call functions.
 
 use crate::ConfigureEvm;
-use alloc::vec::Vec;
+use alloc::{boxed::Box, sync::Arc};
+use alloy_consensus::BlockHeader;
+use alloy_eips::{
+    eip7002::WITHDRAWAL_REQUEST_TYPE, eip7251::CONSOLIDATION_REQUEST_TYPE, eip7685::Requests,
+};
+use alloy_primitives::Bytes;
 use core::fmt::Display;
 use reth_chainspec::EthereumHardforks;
 use reth_execution_errors::BlockExecutionError;
-use reth_primitives::{Block, Header, Request};
 use revm::{Database, DatabaseCommit, Evm};
-use revm_primitives::{BlockEnv, CfgEnvWithHandlerCfg, EnvWithHandlerCfg, ResultAndState, B256};
+use revm_primitives::{BlockEnv, CfgEnvWithHandlerCfg, EnvWithHandlerCfg, EvmState, B256};
 
 mod eip2935;
 mod eip4788;
@@ -16,15 +20,15 @@ mod eip7251;
 
 /// A hook that is called after each state change.
 pub trait OnStateHook {
-    /// Invoked with the result and state after each system call.
-    fn on_state(&mut self, state: &ResultAndState);
+    /// Invoked with the state after each system call.
+    fn on_state(&mut self, state: &EvmState);
 }
 
 impl<F> OnStateHook for F
 where
-    F: FnMut(&ResultAndState),
+    F: FnMut(&EvmState),
 {
-    fn on_state(&mut self, state: &ResultAndState) {
+    fn on_state(&mut self, state: &EvmState) {
         self(state)
     }
 }
@@ -35,34 +39,33 @@ where
 pub struct NoopHook;
 
 impl OnStateHook for NoopHook {
-    fn on_state(&mut self, _state: &ResultAndState) {}
+    fn on_state(&mut self, _state: &EvmState) {}
 }
 
 /// An ephemeral helper type for executing system calls.
 ///
 /// This can be used to chain system transaction calls.
 #[allow(missing_debug_implementations)]
-pub struct SystemCaller<'a, EvmConfig, Chainspec, Hook = NoopHook> {
-    evm_config: &'a EvmConfig,
-    chain_spec: Chainspec,
+pub struct SystemCaller<EvmConfig, Chainspec> {
+    evm_config: EvmConfig,
+    chain_spec: Arc<Chainspec>,
     /// Optional hook to be called after each state change.
-    hook: Option<Hook>,
+    hook: Option<Box<dyn OnStateHook>>,
 }
 
-impl<'a, EvmConfig, Chainspec> SystemCaller<'a, EvmConfig, Chainspec, NoopHook> {
+impl<EvmConfig, Chainspec> SystemCaller<EvmConfig, Chainspec> {
     /// Create a new system caller with the given EVM config, database, and chain spec, and creates
     /// the EVM with the given initialized config and block environment.
-    pub const fn new(evm_config: &'a EvmConfig, chain_spec: Chainspec) -> Self {
+    pub const fn new(evm_config: EvmConfig, chain_spec: Arc<Chainspec>) -> Self {
         Self { evm_config, chain_spec, hook: None }
     }
+
     /// Installs a custom hook to be called after each state change.
-    pub fn with_state_hook<H: OnStateHook>(
-        self,
-        hook: Option<H>,
-    ) -> SystemCaller<'a, EvmConfig, Chainspec, H> {
-        let Self { evm_config, chain_spec, .. } = self;
-        SystemCaller { evm_config, chain_spec, hook }
+    pub fn with_state_hook(&mut self, hook: Option<Box<dyn OnStateHook>>) -> &mut Self {
+        self.hook = hook;
+        self
     }
+
     /// Convenience method to consume the type and drop borrowed fields
     pub fn finish(self) {}
 }
@@ -85,14 +88,13 @@ where
         .build()
 }
 
-impl<EvmConfig, Chainspec, Hook> SystemCaller<'_, EvmConfig, Chainspec, Hook>
+impl<EvmConfig, Chainspec> SystemCaller<EvmConfig, Chainspec>
 where
-    EvmConfig: ConfigureEvm<Header = Header>,
+    EvmConfig: ConfigureEvm,
     Chainspec: EthereumHardforks,
-    Hook: OnStateHook,
 {
     /// Apply pre execution changes.
-    pub fn apply_pre_execution_changes<DB, Ext>(
+    pub fn apply_pre_execution_changes<DB, Ext, Block>(
         &mut self,
         block: &Block,
         evm: &mut Evm<'_, Ext, DB>,
@@ -100,17 +102,18 @@ where
     where
         DB: Database + DatabaseCommit,
         DB::Error: Display,
+        Block: reth_primitives_traits::Block<Header = EvmConfig::Header>,
     {
         self.apply_blockhashes_contract_call(
-            block.timestamp,
-            block.number,
-            block.parent_hash,
+            block.header().timestamp(),
+            block.header().number(),
+            block.header().parent_hash(),
             evm,
         )?;
         self.apply_beacon_root_contract_call(
-            block.timestamp,
-            block.number,
-            block.parent_beacon_block_root,
+            block.header().timestamp(),
+            block.header().number(),
+            block.header().parent_beacon_block_root(),
             evm,
         )?;
 
@@ -121,17 +124,32 @@ where
     pub fn apply_post_execution_changes<DB, Ext>(
         &mut self,
         evm: &mut Evm<'_, Ext, DB>,
-    ) -> Result<Vec<Request>, BlockExecutionError>
+    ) -> Result<Requests, BlockExecutionError>
     where
         DB: Database + DatabaseCommit,
         DB::Error: Display,
     {
+        let mut requests = Requests::default();
+
         // Collect all EIP-7685 requests
         let withdrawal_requests = self.apply_withdrawal_requests_contract_call(evm)?;
+        if !withdrawal_requests.is_empty() {
+            requests.push_request(
+                core::iter::once(WITHDRAWAL_REQUEST_TYPE).chain(withdrawal_requests).collect(),
+            );
+        }
 
         // Collect all EIP-7251 requests
         let consolidation_requests = self.apply_consolidation_requests_contract_call(evm)?;
-        Ok([withdrawal_requests, consolidation_requests].concat())
+        if !consolidation_requests.is_empty() {
+            requests.push_request(
+                core::iter::once(CONSOLIDATION_REQUEST_TYPE)
+                    .chain(consolidation_requests)
+                    .collect(),
+            );
+        }
+
+        Ok(requests)
     }
 
     /// Applies the pre-block call to the EIP-2935 blockhashes contract.
@@ -170,7 +188,7 @@ where
         DB::Error: Display,
     {
         let result_and_state = eip2935::transact_blockhashes_contract_call(
-            &self.evm_config.clone(),
+            &self.evm_config,
             &self.chain_spec,
             timestamp,
             block_number,
@@ -180,7 +198,7 @@ where
 
         if let Some(res) = result_and_state {
             if let Some(ref mut hook) = self.hook {
-                hook.on_state(&res);
+                hook.on_state(&res.state);
             }
             evm.context.evm.db.commit(res.state);
         }
@@ -225,7 +243,7 @@ where
         DB::Error: Display,
     {
         let result_and_state = eip4788::transact_beacon_root_contract_call(
-            &self.evm_config.clone(),
+            &self.evm_config,
             &self.chain_spec,
             timestamp,
             block_number,
@@ -235,7 +253,7 @@ where
 
         if let Some(res) = result_and_state {
             if let Some(ref mut hook) = self.hook {
-                hook.on_state(&res);
+                hook.on_state(&res.state);
             }
             evm.context.evm.db.commit(res.state);
         }
@@ -249,7 +267,7 @@ where
         db: &mut DB,
         initialized_cfg: &CfgEnvWithHandlerCfg,
         initialized_block_env: &BlockEnv,
-    ) -> Result<Vec<Request>, BlockExecutionError>
+    ) -> Result<Bytes, BlockExecutionError>
     where
         DB: Database + DatabaseCommit,
         DB::Error: Display,
@@ -265,7 +283,7 @@ where
     pub fn apply_withdrawal_requests_contract_call<DB, Ext>(
         &mut self,
         evm: &mut Evm<'_, Ext, DB>,
-    ) -> Result<Vec<Request>, BlockExecutionError>
+    ) -> Result<Bytes, BlockExecutionError>
     where
         DB: Database + DatabaseCommit,
         DB::Error: Display,
@@ -274,7 +292,7 @@ where
             eip7002::transact_withdrawal_requests_contract_call(&self.evm_config.clone(), evm)?;
 
         if let Some(ref mut hook) = self.hook {
-            hook.on_state(&result_and_state);
+            hook.on_state(&result_and_state.state);
         }
         evm.context.evm.db.commit(result_and_state.state);
 
@@ -287,7 +305,7 @@ where
         db: &mut DB,
         initialized_cfg: &CfgEnvWithHandlerCfg,
         initialized_block_env: &BlockEnv,
-    ) -> Result<Vec<Request>, BlockExecutionError>
+    ) -> Result<Bytes, BlockExecutionError>
     where
         DB: Database + DatabaseCommit,
         DB::Error: Display,
@@ -303,7 +321,7 @@ where
     pub fn apply_consolidation_requests_contract_call<DB, Ext>(
         &mut self,
         evm: &mut Evm<'_, Ext, DB>,
-    ) -> Result<Vec<Request>, BlockExecutionError>
+    ) -> Result<Bytes, BlockExecutionError>
     where
         DB: Database + DatabaseCommit,
         DB::Error: Display,
@@ -312,7 +330,7 @@ where
             eip7251::transact_consolidation_requests_contract_call(&self.evm_config.clone(), evm)?;
 
         if let Some(ref mut hook) = self.hook {
-            hook.on_state(&result_and_state);
+            hook.on_state(&result_and_state.state);
         }
         evm.context.evm.db.commit(result_and_state.state);
 
@@ -320,7 +338,7 @@ where
     }
 
     /// Delegate to stored `OnStateHook`, noop if hook is `None`.
-    pub fn on_state(&mut self, state: &ResultAndState) {
+    pub fn on_state(&mut self, state: &EvmState) {
         if let Some(ref mut hook) = &mut self.hook {
             hook.on_state(state);
         }

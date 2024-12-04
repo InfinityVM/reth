@@ -25,32 +25,6 @@
 //! before it's re-tried. Nonetheless, the capacity of the buffered hashes cache must be large
 //! enough to buffer many hashes during network failure, to allow for recovery.
 
-use std::{
-    collections::HashMap,
-    pin::Pin,
-    task::{ready, Context, Poll},
-    time::Duration,
-};
-
-use alloy_primitives::TxHash;
-use derive_more::{Constructor, Deref};
-use futures::{stream::FuturesUnordered, Future, FutureExt, Stream, StreamExt};
-use pin_project::pin_project;
-use reth_eth_wire::{
-    DedupPayload, EthVersion, GetPooledTransactions, HandleMempoolData, HandleVersionedMempoolData,
-    PartiallyValidData, RequestTxHashes, ValidAnnouncementData,
-};
-use reth_network_api::PeerRequest;
-use reth_network_p2p::error::{RequestError, RequestResult};
-use reth_network_peers::PeerId;
-use reth_primitives::PooledTransactionsElement;
-use schnellru::ByLength;
-#[cfg(debug_assertions)]
-use smallvec::{smallvec, SmallVec};
-use tokio::sync::{mpsc::error::TrySendError, oneshot, oneshot::error::RecvError};
-use tracing::{debug, trace};
-use validation::FilterOutcome;
-
 use super::{
     config::TransactionFetcherConfig,
     constants::{tx_fetcher::*, SOFT_LIMIT_COUNT_HASHES_IN_GET_POOLED_TRANSACTIONS_REQUEST},
@@ -63,6 +37,32 @@ use crate::{
     metrics::TransactionFetcherMetrics,
     transactions::{validation, PartiallyFilterMessage},
 };
+use alloy_primitives::TxHash;
+use derive_more::{Constructor, Deref};
+use futures::{stream::FuturesUnordered, Future, FutureExt, Stream, StreamExt};
+use pin_project::pin_project;
+use reth_eth_wire::{
+    DedupPayload, EthVersion, GetPooledTransactions, HandleMempoolData, HandleVersionedMempoolData,
+    PartiallyValidData, RequestTxHashes, ValidAnnouncementData,
+};
+use reth_eth_wire_types::{EthNetworkPrimitives, NetworkPrimitives};
+use reth_network_api::PeerRequest;
+use reth_network_p2p::error::{RequestError, RequestResult};
+use reth_network_peers::PeerId;
+use reth_primitives::PooledTransactionsElement;
+use reth_primitives_traits::SignedTransaction;
+use schnellru::ByLength;
+#[cfg(debug_assertions)]
+use smallvec::{smallvec, SmallVec};
+use std::{
+    collections::HashMap,
+    pin::Pin,
+    task::{ready, Context, Poll},
+    time::Duration,
+};
+use tokio::sync::{mpsc::error::TrySendError, oneshot, oneshot::error::RecvError};
+use tracing::{debug, trace};
+use validation::FilterOutcome;
 
 /// The type responsible for fetching missing transactions from peers.
 ///
@@ -70,7 +70,7 @@ use crate::{
 /// new requests on announced hashes.
 #[derive(Debug)]
 #[pin_project]
-pub struct TransactionFetcher {
+pub struct TransactionFetcher<N: NetworkPrimitives = EthNetworkPrimitives> {
     /// All peers with to which a [`GetPooledTransactions`] request is inflight.
     pub active_peers: LruMap<PeerId, u8, ByLength>,
     /// All currently active [`GetPooledTransactions`] requests.
@@ -79,7 +79,7 @@ pub struct TransactionFetcher {
     /// It's disjoint from the set of hashes which are awaiting an idle fallback peer in order to
     /// be fetched.
     #[pin]
-    pub inflight_requests: FuturesUnordered<GetPooledTxRequestFut>,
+    pub inflight_requests: FuturesUnordered<GetPooledTxRequestFut<N::PooledTransaction>>,
     /// Hashes that are awaiting an idle fallback peer so they can be fetched.
     ///
     /// This is a subset of all hashes in the fetcher, and is disjoint from the set of hashes for
@@ -95,9 +95,7 @@ pub struct TransactionFetcher {
     metrics: TransactionFetcherMetrics,
 }
 
-// === impl TransactionFetcher ===
-
-impl TransactionFetcher {
+impl<N: NetworkPrimitives> TransactionFetcher<N> {
     /// Removes the peer from the active set.
     pub(crate) fn remove_peer(&mut self, peer_id: &PeerId) {
         self.active_peers.remove(peer_id);
@@ -289,7 +287,7 @@ impl TransactionFetcher {
 
             // tx is really big, pack request with single tx
             if size >= self.info.soft_limit_byte_size_pooled_transactions_response_on_pack_request {
-                return hashes_from_announcement_iter.collect::<RequestTxHashes>()
+                return hashes_from_announcement_iter.collect()
             }
             acc_size_response = size;
         }
@@ -431,7 +429,7 @@ impl TransactionFetcher {
     /// the request by checking the transactions seen by the peer against the buffer.
     pub fn on_fetch_pending_hashes(
         &mut self,
-        peers: &HashMap<PeerId, PeerMetadata>,
+        peers: &HashMap<PeerId, PeerMetadata<N>>,
         has_capacity_wrt_pending_pool_imports: impl Fn(usize) -> bool,
     ) {
         let init_capacity_req = approx_capacity_get_pooled_transactions_req_eth68(&self.info);
@@ -634,7 +632,7 @@ impl TransactionFetcher {
     pub fn request_transactions_from_peer(
         &mut self,
         new_announced_hashes: RequestTxHashes,
-        peer: &PeerMetadata,
+        peer: &PeerMetadata<N>,
     ) -> Option<RequestTxHashes> {
         let peer_id: PeerId = peer.request_tx.peer_id;
         let conn_eth_version = peer.version;
@@ -688,10 +686,8 @@ impl TransactionFetcher {
         }
 
         let (response, rx) = oneshot::channel();
-        let req: PeerRequest = PeerRequest::GetPooledTransactions {
-            request: GetPooledTransactions(
-                new_announced_hashes.iter().copied().collect::<Vec<_>>(),
-            ),
+        let req = PeerRequest::GetPooledTransactions {
+            request: GetPooledTransactions(new_announced_hashes.iter().copied().collect()),
             response,
         };
 
@@ -906,22 +902,11 @@ impl TransactionFetcher {
     /// [`TransactionsManager`](super::TransactionsManager).
     pub fn on_resolved_get_pooled_transactions_request_fut(
         &mut self,
-        response: GetPooledTxResponse,
-    ) -> FetchEvent {
+        response: GetPooledTxResponse<N::PooledTransaction>,
+    ) -> FetchEvent<N::PooledTransaction> {
         // update peer activity, requests for buffered hashes can only be made to idle
         // fallback peers
         let GetPooledTxResponse { peer_id, mut requested_hashes, result } = response;
-
-        debug_assert!(
-            self.active_peers.get(&peer_id).is_some(),
-            "`{}` has been removed from `@active_peers` before inflight request(s) resolved, broken invariant `@active_peers` and `@inflight_requests`, `%peer_id`: {}, `@hashes_fetch_inflight_and_pending_fetch` for `%requested_hashes`: {:?}",
-            peer_id,
-            peer_id,
-            requested_hashes.iter().map(|hash| {
-                let metadata = self.hashes_fetch_inflight_and_pending_fetch.get(hash);
-                (*hash, metadata.map(|m| (m.retries, m.tx_encoded_length)))
-            }).collect::<Vec<(TxHash, Option<(u8, Option<usize>)>)>>()
-        );
 
         self.decrement_inflight_request_count_for(&peer_id);
 
@@ -1023,8 +1008,7 @@ impl TransactionFetcher {
                 //
                 self.try_buffer_hashes_for_retry(requested_hashes, &peer_id);
 
-                let transactions =
-                    valid_payload.into_data().into_values().collect::<PooledTransactions>();
+                let transactions = valid_payload.into_data().into_values().collect();
 
                 FetchEvent::TransactionsFetched { peer_id, transactions }
             }
@@ -1041,8 +1025,8 @@ impl TransactionFetcher {
     }
 }
 
-impl Stream for TransactionFetcher {
-    type Item = FetchEvent;
+impl<N: NetworkPrimitives> Stream for TransactionFetcher<N> {
+    type Item = FetchEvent<N::PooledTransaction>;
 
     /// Advances all inflight requests and returns the next event.
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -1060,7 +1044,7 @@ impl Stream for TransactionFetcher {
     }
 }
 
-impl Default for TransactionFetcher {
+impl<T: NetworkPrimitives> Default for TransactionFetcher<T> {
     fn default() -> Self {
         Self {
             active_peers: LruMap::new(DEFAULT_MAX_COUNT_CONCURRENT_REQUESTS),
@@ -1107,13 +1091,13 @@ impl TxFetchMetadata {
 
 /// Represents possible events from fetching transactions.
 #[derive(Debug)]
-pub enum FetchEvent {
+pub enum FetchEvent<T = PooledTransactionsElement> {
     /// Triggered when transactions are successfully fetched.
     TransactionsFetched {
         /// The ID of the peer from which transactions were fetched.
         peer_id: PeerId,
         /// The transactions that were fetched, if available.
-        transactions: PooledTransactions,
+        transactions: PooledTransactions<T>,
     },
     /// Triggered when there is an error in fetching transactions.
     FetchError {
@@ -1131,22 +1115,22 @@ pub enum FetchEvent {
 
 /// An inflight request for [`PooledTransactions`] from a peer.
 #[derive(Debug)]
-pub struct GetPooledTxRequest {
+pub struct GetPooledTxRequest<T = PooledTransactionsElement> {
     peer_id: PeerId,
     /// Transaction hashes that were requested, for cleanup purposes
     requested_hashes: RequestTxHashes,
-    response: oneshot::Receiver<RequestResult<PooledTransactions>>,
+    response: oneshot::Receiver<RequestResult<PooledTransactions<T>>>,
 }
 
 /// Upon reception of a response, a [`GetPooledTxRequest`] is deconstructed to form a
 /// [`GetPooledTxResponse`].
 #[derive(Debug)]
-pub struct GetPooledTxResponse {
+pub struct GetPooledTxResponse<T = PooledTransactionsElement> {
     peer_id: PeerId,
     /// Transaction hashes that were requested, for cleanup purposes, since peer may only return a
     /// subset of requested hashes.
     requested_hashes: RequestTxHashes,
-    result: Result<RequestResult<PooledTransactions>, RecvError>,
+    result: Result<RequestResult<PooledTransactions<T>>, RecvError>,
 }
 
 /// Stores the response receiver made by sending a [`GetPooledTransactions`] request to a peer's
@@ -1154,24 +1138,24 @@ pub struct GetPooledTxResponse {
 #[must_use = "futures do nothing unless polled"]
 #[pin_project::pin_project]
 #[derive(Debug)]
-pub struct GetPooledTxRequestFut {
+pub struct GetPooledTxRequestFut<T = PooledTransactionsElement> {
     #[pin]
-    inner: Option<GetPooledTxRequest>,
+    inner: Option<GetPooledTxRequest<T>>,
 }
 
-impl GetPooledTxRequestFut {
+impl<T> GetPooledTxRequestFut<T> {
     #[inline]
     const fn new(
         peer_id: PeerId,
         requested_hashes: RequestTxHashes,
-        response: oneshot::Receiver<RequestResult<PooledTransactions>>,
+        response: oneshot::Receiver<RequestResult<PooledTransactions<T>>>,
     ) -> Self {
         Self { inner: Some(GetPooledTxRequest { peer_id, requested_hashes, response }) }
     }
 }
 
-impl Future for GetPooledTxRequestFut {
-    type Output = GetPooledTxResponse;
+impl<T> Future for GetPooledTxRequestFut<T> {
+    type Output = GetPooledTxResponse<T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut req = self.as_mut().project().inner.take().expect("polled after completion");
@@ -1191,18 +1175,18 @@ impl Future for GetPooledTxRequestFut {
 
 /// Wrapper of unverified [`PooledTransactions`].
 #[derive(Debug, Constructor, Deref)]
-pub struct UnverifiedPooledTransactions {
-    txns: PooledTransactions,
+pub struct UnverifiedPooledTransactions<T> {
+    txns: PooledTransactions<T>,
 }
 
 /// [`PooledTransactions`] that have been successfully verified.
 #[derive(Debug, Constructor, Deref)]
-pub struct VerifiedPooledTransactions {
-    txns: PooledTransactions,
+pub struct VerifiedPooledTransactions<T> {
+    txns: PooledTransactions<T>,
 }
 
-impl DedupPayload for VerifiedPooledTransactions {
-    type Value = PooledTransactionsElement;
+impl<T: SignedTransaction> DedupPayload for VerifiedPooledTransactions<T> {
+    type Value = T;
 
     fn is_empty(&self) -> bool {
         self.txns.is_empty()
@@ -1213,30 +1197,31 @@ impl DedupPayload for VerifiedPooledTransactions {
     }
 
     fn dedup(self) -> PartiallyValidData<Self::Value> {
-        let Self { txns } = self;
-        let unique_fetched = txns
-            .into_iter()
-            .map(|tx| (*tx.hash(), tx))
-            .collect::<HashMap<TxHash, PooledTransactionsElement>>();
-
-        PartiallyValidData::from_raw_data(unique_fetched, None)
+        PartiallyValidData::from_raw_data(
+            self.txns.into_iter().map(|tx| (*tx.tx_hash(), tx)).collect(),
+            None,
+        )
     }
 }
 
 trait VerifyPooledTransactionsResponse {
+    type Transaction: SignedTransaction;
+
     fn verify(
         self,
         requested_hashes: &RequestTxHashes,
         peer_id: &PeerId,
-    ) -> (VerificationOutcome, VerifiedPooledTransactions);
+    ) -> (VerificationOutcome, VerifiedPooledTransactions<Self::Transaction>);
 }
 
-impl VerifyPooledTransactionsResponse for UnverifiedPooledTransactions {
+impl<T: SignedTransaction> VerifyPooledTransactionsResponse for UnverifiedPooledTransactions<T> {
+    type Transaction = T;
+
     fn verify(
         self,
         requested_hashes: &RequestTxHashes,
         _peer_id: &PeerId,
-    ) -> (VerificationOutcome, VerifiedPooledTransactions) {
+    ) -> (VerificationOutcome, VerifiedPooledTransactions<T>) {
         let mut verification_outcome = VerificationOutcome::Ok;
 
         let Self { mut txns } = self;
@@ -1247,11 +1232,11 @@ impl VerifyPooledTransactionsResponse for UnverifiedPooledTransactions {
         let mut tx_hashes_not_requested_count = 0;
 
         txns.0.retain(|tx| {
-            if !requested_hashes.contains(tx.hash()) {
+            if !requested_hashes.contains(tx.tx_hash()) {
                 verification_outcome = VerificationOutcome::ReportPeer;
 
                 #[cfg(debug_assertions)]
-                tx_hashes_not_requested.push(*tx.hash());
+                tx_hashes_not_requested.push(*tx.tx_hash());
                 #[cfg(not(debug_assertions))]
                 {
                     tx_hashes_not_requested_count += 1;
@@ -1354,16 +1339,13 @@ struct TxFetcherSearchDurations {
 
 #[cfg(test)]
 mod test {
-    use std::{collections::HashSet, str::FromStr};
-
+    use super::*;
+    use crate::transactions::tests::{default_cache, new_mock_session};
     use alloy_primitives::{hex, B256};
     use alloy_rlp::Decodable;
     use derive_more::IntoIterator;
     use reth_primitives::TransactionSigned;
-
-    use crate::transactions::tests::{default_cache, new_mock_session};
-
-    use super::*;
+    use std::{collections::HashSet, str::FromStr};
 
     #[derive(IntoIterator)]
     struct TestValidAnnouncementData(Vec<(TxHash, Option<(u8, usize)>)>);
@@ -1394,7 +1376,7 @@ mod test {
 
         // RIG TEST
 
-        let tx_fetcher = &mut TransactionFetcher::default();
+        let tx_fetcher = &mut TransactionFetcher::<EthNetworkPrimitives>::default();
 
         let eth68_hashes = [
             B256::from_slice(&[1; 32]),

@@ -58,13 +58,16 @@ impl AccountHashingStage {
     ///
     /// Proceeds to go to the `BlockTransitionIndex` end, go back `transitions` and change the
     /// account state in the `AccountChangeSets` table.
-    pub fn seed<
-        Tx: DbTx + DbTxMut + 'static,
-        Spec: Send + Sync + 'static + reth_chainspec::EthereumHardforks,
-    >(
-        provider: &reth_provider::DatabaseProvider<Tx, Spec>,
+    pub fn seed<Tx: DbTx + DbTxMut + 'static, N: reth_provider::providers::ProviderNodeTypes>(
+        provider: &reth_provider::DatabaseProvider<Tx, N>,
         opts: SeedOpts,
-    ) -> Result<Vec<(alloy_primitives::Address, reth_primitives::Account)>, StageError> {
+    ) -> Result<Vec<(alloy_primitives::Address, reth_primitives::Account)>, StageError>
+    where
+        N::Primitives: reth_primitives_traits::FullNodePrimitives<
+            BlockBody = reth_primitives::BlockBody,
+            BlockHeader = reth_primitives::Header,
+        >,
+    {
         use alloy_primitives::U256;
         use reth_db_api::models::AccountBeforeTx;
         use reth_provider::{StaticFileProviderFactory, StaticFileWriter};
@@ -234,7 +237,7 @@ where
             input.unwind_block_range_with_threshold(self.commit_threshold);
 
         // Aggregate all transition changesets and make a list of accounts that have been changed.
-        provider.unwind_account_hashing(range)?;
+        provider.unwind_account_hashing_range(range)?;
 
         let mut stage_checkpoint =
             input.checkpoint.account_hashing_stage_checkpoint().unwrap_or_default();

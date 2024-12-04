@@ -1,23 +1,24 @@
 //! Collection of methods for block validation.
 
+use alloy_consensus::{constants::MAXIMUM_EXTRA_DATA_SIZE, BlockHeader};
+use alloy_eips::{
+    calc_next_block_base_fee,
+    eip4844::{DATA_GAS_PER_BLOB, MAX_DATA_GAS_PER_BLOCK},
+};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_consensus::ConsensusError;
 use reth_primitives::{
-    constants::{
-        eip4844::{DATA_GAS_PER_BLOB, MAX_DATA_GAS_PER_BLOCK},
-        MAXIMUM_EXTRA_DATA_SIZE,
-    },
-    EthereumHardfork, GotExpected, Header, SealedBlock, SealedHeader,
+    BlockBody, BlockBodyTxExt, EthereumHardfork, GotExpected, SealedBlock, SealedHeader,
 };
 use revm_primitives::calc_excess_blob_gas;
 
 /// Gas used needs to be less than gas limit. Gas used is going to be checked after execution.
 #[inline]
-pub const fn validate_header_gas(header: &Header) -> Result<(), ConsensusError> {
-    if header.gas_used > header.gas_limit {
+pub fn validate_header_gas<H: BlockHeader>(header: &H) -> Result<(), ConsensusError> {
+    if header.gas_used() > header.gas_limit() {
         return Err(ConsensusError::HeaderGasUsedExceedsGasLimit {
-            gas_used: header.gas_used,
-            gas_limit: header.gas_limit,
+            gas_used: header.gas_used(),
+            gas_limit: header.gas_limit(),
         })
     }
     Ok(())
@@ -25,12 +26,12 @@ pub const fn validate_header_gas(header: &Header) -> Result<(), ConsensusError> 
 
 /// Ensure the EIP-1559 base fee is set if the London hardfork is active.
 #[inline]
-pub fn validate_header_base_fee<ChainSpec: EthereumHardforks>(
-    header: &Header,
+pub fn validate_header_base_fee<H: BlockHeader, ChainSpec: EthereumHardforks>(
+    header: &H,
     chain_spec: &ChainSpec,
 ) -> Result<(), ConsensusError> {
-    if chain_spec.is_fork_active_at_block(EthereumHardfork::London, header.number) &&
-        header.base_fee_per_gas.is_none()
+    if chain_spec.is_fork_active_at_block(EthereumHardfork::London, header.number()) &&
+        header.base_fee_per_gas().is_none()
     {
         return Err(ConsensusError::BaseFeeMissing)
     }
@@ -43,15 +44,16 @@ pub fn validate_header_base_fee<ChainSpec: EthereumHardforks>(
 ///
 /// [EIP-4895]: https://eips.ethereum.org/EIPS/eip-4895
 #[inline]
-pub fn validate_shanghai_withdrawals(block: &SealedBlock) -> Result<(), ConsensusError> {
-    let withdrawals =
-        block.body.withdrawals.as_ref().ok_or(ConsensusError::BodyWithdrawalsMissing)?;
+pub fn validate_shanghai_withdrawals<H: BlockHeader, B: reth_primitives_traits::BlockBody>(
+    block: &SealedBlock<H, B>,
+) -> Result<(), ConsensusError> {
+    let withdrawals = block.body.withdrawals().ok_or(ConsensusError::BodyWithdrawalsMissing)?;
     let withdrawals_root = reth_primitives::proofs::calculate_withdrawals_root(withdrawals);
     let header_withdrawals_root =
-        block.withdrawals_root.as_ref().ok_or(ConsensusError::WithdrawalsRootMissing)?;
+        block.withdrawals_root().ok_or(ConsensusError::WithdrawalsRootMissing)?;
     if withdrawals_root != *header_withdrawals_root {
         return Err(ConsensusError::BodyWithdrawalsRootDiff(
-            GotExpected { got: withdrawals_root, expected: *header_withdrawals_root }.into(),
+            GotExpected { got: withdrawals_root, expected: header_withdrawals_root }.into(),
         ));
     }
     Ok(())
@@ -63,11 +65,14 @@ pub fn validate_shanghai_withdrawals(block: &SealedBlock) -> Result<(), Consensu
 ///
 /// [EIP-4844]: https://eips.ethereum.org/EIPS/eip-4844
 #[inline]
-pub fn validate_cancun_gas(block: &SealedBlock) -> Result<(), ConsensusError> {
+pub fn validate_cancun_gas<H: BlockHeader, B: reth_primitives_traits::BlockBody>(
+    block: &SealedBlock<H, B>,
+) -> Result<(), ConsensusError> {
     // Check that the blob gas used in the header matches the sum of the blob gas used by each
     // blob tx
-    let header_blob_gas_used = block.blob_gas_used.ok_or(ConsensusError::BlobGasUsedMissing)?;
-    let total_blob_gas = block.blob_gas_used();
+    let header_blob_gas_used =
+        block.header().blob_gas_used().ok_or(ConsensusError::BlobGasUsedMissing)?;
+    let total_blob_gas = block.body.blob_gas_used();
     if total_blob_gas != header_blob_gas_used {
         return Err(ConsensusError::BlobGasUsedDiff(GotExpected {
             got: header_blob_gas_used,
@@ -77,21 +82,46 @@ pub fn validate_cancun_gas(block: &SealedBlock) -> Result<(), ConsensusError> {
     Ok(())
 }
 
-/// Validate that requests root is present if Prague is active.
+/// Ensures the block response data matches the header.
 ///
-/// See [EIP-7685]: General purpose execution layer requests
-///
-/// [EIP-7685]: https://eips.ethereum.org/EIPS/eip-7685
-#[inline]
-pub fn validate_prague_request(block: &SealedBlock) -> Result<(), ConsensusError> {
-    let requests_root =
-        block.body.calculate_requests_root().ok_or(ConsensusError::BodyRequestsMissing)?;
-    let header_requests_root = block.requests_root.ok_or(ConsensusError::RequestsRootMissing)?;
-    if requests_root != *header_requests_root {
-        return Err(ConsensusError::BodyRequestsRootDiff(
-            GotExpected { got: requests_root, expected: header_requests_root }.into(),
-        ));
+/// This ensures the body response items match the header's hashes:
+///   - ommer hash
+///   - transaction root
+///   - withdrawals root
+pub fn validate_body_against_header(
+    body: &BlockBody,
+    header: &SealedHeader,
+) -> Result<(), ConsensusError> {
+    let ommers_hash = body.calculate_ommers_root();
+    if header.ommers_hash != ommers_hash {
+        return Err(ConsensusError::BodyOmmersHashDiff(
+            GotExpected { got: ommers_hash, expected: header.ommers_hash }.into(),
+        ))
     }
+
+    let tx_root = body.calculate_tx_root();
+    if header.transactions_root != tx_root {
+        return Err(ConsensusError::BodyTransactionRootDiff(
+            GotExpected { got: tx_root, expected: header.transactions_root }.into(),
+        ))
+    }
+
+    match (header.withdrawals_root, &body.withdrawals) {
+        (Some(header_withdrawals_root), Some(withdrawals)) => {
+            let withdrawals = withdrawals.as_slice();
+            let withdrawals_root = reth_primitives::proofs::calculate_withdrawals_root(withdrawals);
+            if withdrawals_root != header_withdrawals_root {
+                return Err(ConsensusError::BodyWithdrawalsRootDiff(
+                    GotExpected { got: withdrawals_root, expected: header_withdrawals_root }.into(),
+                ))
+            }
+        }
+        (None, None) => {
+            // this is ok because we assume the fork is not active in this case
+        }
+        _ => return Err(ConsensusError::WithdrawalsRootUnexpected),
+    }
+
     Ok(())
 }
 
@@ -127,10 +157,6 @@ pub fn validate_block_pre_execution<ChainSpec: EthereumHardforks>(
         validate_cancun_gas(block)?;
     }
 
-    if chain_spec.is_prague_active_at_timestamp(block.timestamp) {
-        validate_prague_request(block)?;
-    }
-
     Ok(())
 }
 
@@ -142,11 +168,11 @@ pub fn validate_block_pre_execution<ChainSpec: EthereumHardforks>(
 ///  * `blob_gas_used` is less than or equal to `MAX_DATA_GAS_PER_BLOCK`
 ///  * `blob_gas_used` is a multiple of `DATA_GAS_PER_BLOB`
 ///  * `excess_blob_gas` is a multiple of `DATA_GAS_PER_BLOB`
-pub fn validate_4844_header_standalone(header: &Header) -> Result<(), ConsensusError> {
-    let blob_gas_used = header.blob_gas_used.ok_or(ConsensusError::BlobGasUsedMissing)?;
-    let excess_blob_gas = header.excess_blob_gas.ok_or(ConsensusError::ExcessBlobGasMissing)?;
+pub fn validate_4844_header_standalone<H: BlockHeader>(header: &H) -> Result<(), ConsensusError> {
+    let blob_gas_used = header.blob_gas_used().ok_or(ConsensusError::BlobGasUsedMissing)?;
+    let excess_blob_gas = header.excess_blob_gas().ok_or(ConsensusError::ExcessBlobGasMissing)?;
 
-    if header.parent_beacon_block_root.is_none() {
+    if header.parent_beacon_block_root().is_none() {
         return Err(ConsensusError::ParentBeaconBlockRootMissing)
     }
 
@@ -181,8 +207,8 @@ pub fn validate_4844_header_standalone(header: &Header) -> Result<(), ConsensusE
 /// From yellow paper: extraData: An arbitrary byte array containing data relevant to this block.
 /// This must be 32 bytes or fewer; formally Hx.
 #[inline]
-pub fn validate_header_extradata(header: &Header) -> Result<(), ConsensusError> {
-    let extradata_len = header.extra_data.len();
+pub fn validate_header_extradata<H: BlockHeader>(header: &H) -> Result<(), ConsensusError> {
+    let extradata_len = header.extra_data().len();
     if extradata_len > MAXIMUM_EXTRA_DATA_SIZE {
         Err(ConsensusError::ExtraDataExceedsMax { len: extradata_len })
     } else {
@@ -195,21 +221,21 @@ pub fn validate_header_extradata(header: &Header) -> Result<(), ConsensusError> 
 /// This function ensures that the header block number is sequential and that the hash of the parent
 /// header matches the parent hash in the header.
 #[inline]
-pub fn validate_against_parent_hash_number(
-    header: &Header,
+pub fn validate_against_parent_hash_number<H: BlockHeader>(
+    header: &H,
     parent: &SealedHeader,
 ) -> Result<(), ConsensusError> {
     // Parent number is consistent.
-    if parent.number + 1 != header.number {
+    if parent.number + 1 != header.number() {
         return Err(ConsensusError::ParentBlockNumberMismatch {
             parent_block_number: parent.number,
-            block_number: header.number,
+            block_number: header.number(),
         })
     }
 
-    if parent.hash() != header.parent_hash {
+    if parent.hash() != header.parent_hash() {
         return Err(ConsensusError::ParentHashMismatch(
-            GotExpected { got: header.parent_hash, expected: parent.hash() }.into(),
+            GotExpected { got: header.parent_hash(), expected: parent.hash() }.into(),
         ))
     }
 
@@ -218,23 +244,30 @@ pub fn validate_against_parent_hash_number(
 
 /// Validates the base fee against the parent and EIP-1559 rules.
 #[inline]
-pub fn validate_against_parent_eip1559_base_fee<ChainSpec: EthChainSpec + EthereumHardforks>(
-    header: &Header,
-    parent: &Header,
+pub fn validate_against_parent_eip1559_base_fee<
+    H: BlockHeader,
+    ChainSpec: EthChainSpec + EthereumHardforks,
+>(
+    header: &H,
+    parent: &H,
     chain_spec: &ChainSpec,
 ) -> Result<(), ConsensusError> {
-    if chain_spec.fork(EthereumHardfork::London).active_at_block(header.number) {
-        let base_fee = header.base_fee_per_gas.ok_or(ConsensusError::BaseFeeMissing)?;
+    if chain_spec.fork(EthereumHardfork::London).active_at_block(header.number()) {
+        let base_fee = header.base_fee_per_gas().ok_or(ConsensusError::BaseFeeMissing)?;
 
         let expected_base_fee =
-            if chain_spec.fork(EthereumHardfork::London).transitions_at_block(header.number) {
-                reth_primitives::constants::EIP1559_INITIAL_BASE_FEE
+            if chain_spec.fork(EthereumHardfork::London).transitions_at_block(header.number()) {
+                alloy_eips::eip1559::INITIAL_BASE_FEE
             } else {
                 // This BaseFeeMissing will not happen as previous blocks are checked to have
                 // them.
-                parent
-                    .next_block_base_fee(chain_spec.base_fee_params_at_timestamp(header.timestamp))
-                    .ok_or(ConsensusError::BaseFeeMissing)?
+                let base_fee = parent.base_fee_per_gas().ok_or(ConsensusError::BaseFeeMissing)?;
+                calc_next_block_base_fee(
+                    parent.gas_used(),
+                    parent.gas_limit(),
+                    base_fee,
+                    chain_spec.base_fee_params_at_timestamp(header.timestamp()),
+                )
             };
         if expected_base_fee != base_fee {
             return Err(ConsensusError::BaseFeeDiff(GotExpected {
@@ -249,14 +282,14 @@ pub fn validate_against_parent_eip1559_base_fee<ChainSpec: EthChainSpec + Ethere
 
 /// Validates the timestamp against the parent to make sure it is in the past.
 #[inline]
-pub const fn validate_against_parent_timestamp(
-    header: &Header,
-    parent: &Header,
+pub fn validate_against_parent_timestamp<H: BlockHeader>(
+    header: &H,
+    parent: &H,
 ) -> Result<(), ConsensusError> {
-    if header.timestamp <= parent.timestamp {
+    if header.timestamp() <= parent.timestamp() {
         return Err(ConsensusError::TimestampIsInPast {
-            parent_timestamp: parent.timestamp,
-            timestamp: header.timestamp,
+            parent_timestamp: parent.timestamp(),
+            timestamp: header.timestamp(),
         })
     }
     Ok(())
@@ -266,9 +299,9 @@ pub const fn validate_against_parent_timestamp(
 /// ensures that the `blob_gas_used` and `excess_blob_gas` fields exist in the child header, and
 /// that the `excess_blob_gas` field matches the expected `excess_blob_gas` calculated from the
 /// parent header fields.
-pub fn validate_against_parent_4844(
-    header: &Header,
-    parent: &Header,
+pub fn validate_against_parent_4844<H: BlockHeader>(
+    header: &H,
+    parent: &H,
 ) -> Result<(), ConsensusError> {
     // From [EIP-4844](https://eips.ethereum.org/EIPS/eip-4844#header-extension):
     //
@@ -276,13 +309,13 @@ pub fn validate_against_parent_4844(
     // > are evaluated as 0.
     //
     // This means in the first post-fork block, calc_excess_blob_gas will return 0.
-    let parent_blob_gas_used = parent.blob_gas_used.unwrap_or(0);
-    let parent_excess_blob_gas = parent.excess_blob_gas.unwrap_or(0);
+    let parent_blob_gas_used = parent.blob_gas_used().unwrap_or(0);
+    let parent_excess_blob_gas = parent.excess_blob_gas().unwrap_or(0);
 
-    if header.blob_gas_used.is_none() {
+    if header.blob_gas_used().is_none() {
         return Err(ConsensusError::BlobGasUsedMissing)
     }
-    let excess_blob_gas = header.excess_blob_gas.ok_or(ConsensusError::ExcessBlobGasMissing)?;
+    let excess_blob_gas = header.excess_blob_gas().ok_or(ConsensusError::ExcessBlobGasMissing)?;
 
     let expected_excess_blob_gas =
         calc_excess_blob_gas(parent_excess_blob_gas, parent_blob_gas_used);
@@ -300,17 +333,19 @@ pub fn validate_against_parent_4844(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::TxEip4844;
+    use alloy_consensus::{Header, TxEip4844, EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH};
+    use alloy_eips::{
+        eip4895::{Withdrawal, Withdrawals},
+        BlockHashOrNumber,
+    };
     use alloy_primitives::{
-        hex_literal::hex, Address, BlockHash, BlockNumber, Bytes, Parity, Sealable, U256,
+        hex_literal::hex, Address, BlockHash, BlockNumber, Bytes, PrimitiveSignature as Signature,
+        U256,
     };
     use mockall::mock;
     use rand::Rng;
     use reth_chainspec::ChainSpecBuilder;
-    use reth_primitives::{
-        proofs, Account, BlockBody, BlockHashOrNumber, Signature, Transaction, TransactionSigned,
-        Withdrawal, Withdrawals,
-    };
+    use reth_primitives::{proofs, Account, BlockBody, Transaction, TransactionSigned};
     use reth_storage_api::{
         errors::provider::ProviderResult, AccountReader, HeaderProvider, WithdrawalsProvider,
     };
@@ -356,6 +391,8 @@ mod tests {
     }
 
     impl HeaderProvider for Provider {
+        type Header = Header;
+
         fn is_known(&self, _block_hash: &BlockHash) -> ProviderResult<bool> {
             Ok(self.is_known)
         }
@@ -429,9 +466,9 @@ mod tests {
             blob_versioned_hashes: std::iter::repeat_with(|| rng.gen()).take(num_blobs).collect(),
         });
 
-        let signature = Signature::new(U256::default(), U256::default(), Parity::Parity(true));
+        let signature = Signature::new(U256::default(), U256::default(), true);
 
-        TransactionSigned::from_transaction_and_signature(request, signature)
+        TransactionSigned::new_unhashed(request, signature)
     }
 
     /// got test block
@@ -441,11 +478,11 @@ mod tests {
 
         let header = Header {
             parent_hash: hex!("859fad46e75d9be177c2584843501f2270c7e5231711e90848290d12d7c6dcdd").into(),
-            ommers_hash: hex!("1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347").into(),
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
             beneficiary: hex!("4675c7e5baafbffbca748158becba61ef3b0a263").into(),
             state_root: hex!("8337403406e368b3e40411138f4868f79f6d835825d55fd0c2f6e17b1a3948e9").into(),
-            transactions_root: hex!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421").into(),
-            receipts_root: hex!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421").into(),
+            transactions_root: EMPTY_ROOT_HASH,
+            receipts_root: EMPTY_ROOT_HASH,
             logs_bloom: hex!("002400000000004000220000800002000000000000000000000000000000100000000000000000100000000000000021020000000800000006000000002100040000000c0004000000000008000008200000000000000000000000008000000001040000020000020000002000000800000002000020000000022010000000000000010002001000000000020200000000000001000200880000004000000900020000000000020000000040000000000000000000000000000080000000000001000002000000000000012000200020000000000000001000000000000020000010321400000000100000000000000000000000000000400000000000000000").into(),
             difficulty: U256::ZERO, // total difficulty: 0xc70d815d562d3cfa955).into(),
             number: 0xf21d20,
@@ -460,7 +497,8 @@ mod tests {
             blob_gas_used: None,
             excess_blob_gas: None,
             parent_beacon_block_root: None,
-            requests_root: None
+            requests_hash: None,
+            target_blobs_per_block: None,
         };
         // size: 0x9b5
 
@@ -474,13 +512,10 @@ mod tests {
         let ommers = Vec::new();
         let transactions = Vec::new();
 
-        let sealed = header.seal_slow();
-        let (header, seal) = sealed.into_parts();
-
         (
             SealedBlock {
-                header: SealedHeader::new(header, seal),
-                body: BlockBody { transactions, ommers, withdrawals: None, requests: None },
+                header: SealedHeader::seal(header),
+                body: BlockBody { transactions, ommers, withdrawals: None },
             },
             parent,
         )
@@ -498,15 +533,13 @@ mod tests {
                     .collect(),
             );
 
-            let sealed = Header {
+            let header = Header {
                 withdrawals_root: Some(proofs::calculate_withdrawals_root(&withdrawals)),
                 ..Default::default()
-            }
-            .seal_slow();
-            let (header, seal) = sealed.into_parts();
+            };
 
             SealedBlock {
-                header: SealedHeader::new(header, seal),
+                header: SealedHeader::seal(header),
                 body: BlockBody { withdrawals: Some(withdrawals), ..Default::default() },
             }
         };
@@ -537,22 +570,19 @@ mod tests {
         // create a tx with 10 blobs
         let transaction = mock_blob_tx(1, 10);
 
-        let sealed = Header {
+        let header = Header {
             base_fee_per_gas: Some(1337),
             withdrawals_root: Some(proofs::calculate_withdrawals_root(&[])),
             blob_gas_used: Some(1),
             transactions_root: proofs::calculate_transaction_root(&[transaction.clone()]),
             ..Default::default()
-        }
-        .seal_slow();
-        let (header, seal) = sealed.into_parts();
-        let header = SealedHeader::new(header, seal);
+        };
+        let header = SealedHeader::seal(header);
 
         let body = BlockBody {
             transactions: vec![transaction],
             ommers: vec![],
             withdrawals: Some(Withdrawals::default()),
-            requests: None,
         };
 
         let block = SealedBlock::new(header, body);

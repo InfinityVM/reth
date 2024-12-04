@@ -8,14 +8,17 @@ use alloy_provider::{ext::AdminApi, ProviderBuilder};
 use futures::StreamExt;
 use reth_chainspec::MAINNET;
 use reth_discv4::Discv4Config;
-use reth_eth_wire::{DisconnectReason, HeadersDirection};
+use reth_eth_wire::{DisconnectReason, EthNetworkPrimitives, HeadersDirection};
 use reth_net_banlist::BanList;
 use reth_network::{
     test_utils::{enr_to_peer_id, NetworkEventStream, PeerConfig, Testnet, GETH_TIMEOUT},
     BlockDownloaderProvider, NetworkConfigBuilder, NetworkEvent, NetworkEventListenerProvider,
     NetworkManager, PeersConfig,
 };
-use reth_network_api::{NetworkInfo, Peers, PeersInfo};
+use reth_network_api::{
+    events::{PeerEvent, SessionInfo},
+    NetworkInfo, Peers, PeersInfo,
+};
 use reth_network_p2p::{
     headers::client::{HeadersClient, HeadersRequest},
     sync::{NetworkSyncUpdater, SyncState},
@@ -59,13 +62,15 @@ async fn test_establish_connections() {
         let mut established = listener0.take(4);
         while let Some(ev) = established.next().await {
             match ev {
-                NetworkEvent::SessionClosed { .. } | NetworkEvent::PeerRemoved(_) => {
+                NetworkEvent::Peer(PeerEvent::SessionClosed { .. } | PeerEvent::PeerRemoved(_)) => {
                     panic!("unexpected event")
                 }
-                NetworkEvent::SessionEstablished { peer_id, .. } => {
-                    assert!(expected_connections.remove(&peer_id))
+                NetworkEvent::ActivePeerSession { info, .. } |
+                NetworkEvent::Peer(PeerEvent::SessionEstablished(info)) => {
+                    let SessionInfo { peer_id, .. } = info;
+                    assert!(expected_connections.remove(&peer_id));
                 }
-                NetworkEvent::PeerAdded(peer_id) => {
+                NetworkEvent::Peer(PeerEvent::PeerAdded(peer_id)) => {
                     assert!(expected_peers.remove(&peer_id))
                 }
             }
@@ -204,8 +209,9 @@ async fn test_connect_with_boot_nodes() {
     let mut discv4 = Discv4Config::builder();
     discv4.add_boot_nodes(mainnet_nodes());
 
-    let config =
-        NetworkConfigBuilder::new(secret_key).discovery(discv4).build(NoopProvider::default());
+    let config = NetworkConfigBuilder::<EthNetworkPrimitives>::new(secret_key)
+        .discovery(discv4)
+        .build(NoopProvider::default());
     let network = NetworkManager::new(config).await.unwrap();
 
     let handle = network.handle().clone();
@@ -495,11 +501,16 @@ async fn test_geth_disconnect() {
         handle.add_peer(geth_peer_id, geth_socket);
 
         match events.next().await {
-            Some(NetworkEvent::PeerAdded(peer_id)) => assert_eq!(peer_id, geth_peer_id),
+            Some(NetworkEvent::Peer(PeerEvent::PeerAdded(peer_id))) => {
+                assert_eq!(peer_id, geth_peer_id)
+            }
             _ => panic!("Expected a peer added event"),
         }
 
-        if let Some(NetworkEvent::SessionEstablished { peer_id, .. }) = events.next().await {
+        if let Some(NetworkEvent::Peer(PeerEvent::SessionEstablished(session_info))) =
+            events.next().await
+        {
+            let SessionInfo { peer_id, .. } = session_info;
             assert_eq!(peer_id, geth_peer_id);
         } else {
             panic!("Expected a session established event");
@@ -509,7 +520,9 @@ async fn test_geth_disconnect() {
         handle.disconnect_peer(geth_peer_id);
 
         // wait for a disconnect from geth
-        if let Some(NetworkEvent::SessionClosed { peer_id, .. }) = events.next().await {
+        if let Some(NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, .. })) =
+            events.next().await
+        {
             assert_eq!(peer_id, geth_peer_id);
         } else {
             panic!("Expected a session closed event");
@@ -572,7 +585,7 @@ async fn test_disconnect_incoming_when_exceeded_incoming_connections() {
     let secret_key = SecretKey::new(&mut rand::thread_rng());
     let peers_config = PeersConfig::default().with_max_inbound(0);
 
-    let config = NetworkConfigBuilder::new(secret_key)
+    let config = NetworkConfigBuilder::<EthNetworkPrimitives>::new(secret_key)
         .listener_port(0)
         .disable_discovery()
         .peer_config(peers_config)

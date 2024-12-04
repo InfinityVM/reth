@@ -169,7 +169,7 @@ where
         let (range, unwind_progress, _) =
             input.unwind_block_range_with_threshold(self.commit_threshold);
 
-        provider.unwind_storage_hashing(BlockNumberAddress::range(range))?;
+        provider.unwind_storage_hashing_range(BlockNumberAddress::range(range))?;
 
         let mut stage_checkpoint =
             input.checkpoint.storage_hashing_stage_checkpoint().unwrap_or_default();
@@ -359,10 +359,7 @@ mod tests {
                                 transaction.hash(),
                                 next_tx_num,
                             )?;
-                            tx.put::<tables::Transactions>(
-                                next_tx_num,
-                                transaction.clone().into(),
-                            )?;
+                            tx.put::<tables::Transactions>(next_tx_num, transaction.clone())?;
 
                             let (addr, _) =
                                 accounts.get_mut(rng.gen::<usize>() % n_accounts as usize).unwrap();

@@ -2,12 +2,12 @@
 //! Standalone http tests
 
 use crate::utils::{launch_http, launch_http_ws, launch_ws};
+use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_primitives::{hex_literal::hex, Address, Bytes, TxHash, B256, B64, U256, U64};
-use alloy_rpc_types::{
-    Block, FeeHistory, Filter, Index, Log, PendingTransactionFilterKind, SyncStatus, Transaction,
-    TransactionReceipt,
+use alloy_rpc_types_eth::{
+    transaction::TransactionRequest, Block, FeeHistory, Filter, Index, Log,
+    PendingTransactionFilterKind, SyncStatus, Transaction, TransactionReceipt,
 };
-use alloy_rpc_types_eth::transaction::TransactionRequest;
 use alloy_rpc_types_trace::filter::TraceFilter;
 use jsonrpsee::{
     core::{
@@ -19,7 +19,7 @@ use jsonrpsee::{
     types::error::ErrorCode,
 };
 use reth_network_peers::NodeRecord;
-use reth_primitives::{BlockId, BlockNumberOrTag, Receipt};
+use reth_primitives::Receipt;
 use reth_rpc_api::{
     clients::{AdminApiClient, EthApiClient},
     DebugApiClient, EthFilterApiClient, NetApiClient, OtterscanClient, TraceApiClient,
@@ -259,7 +259,7 @@ where
         Some(block_number.into()),
     )
     .await
-    .unwrap();
+    .unwrap_err();
     EthApiClient::<Transaction, Block, Receipt>::estimate_gas(
         client,
         call_request.clone(),
@@ -267,7 +267,7 @@ where
         None,
     )
     .await
-    .unwrap();
+    .unwrap_err();
     EthApiClient::<Transaction, Block, Receipt>::call(
         client,
         call_request.clone(),
@@ -276,9 +276,15 @@ where
         None,
     )
     .await
-    .unwrap();
+    .unwrap_err();
     EthApiClient::<Transaction, Block, Receipt>::syncing(client).await.unwrap();
-    EthApiClient::<Transaction, Block, Receipt>::send_transaction(client, transaction_request)
+    EthApiClient::<Transaction, Block, Receipt>::send_transaction(
+        client,
+        transaction_request.clone(),
+    )
+    .await
+    .unwrap_err();
+    EthApiClient::<Transaction, Block, Receipt>::sign_transaction(client, transaction_request)
         .await
         .unwrap_err();
     EthApiClient::<Transaction, Block, Receipt>::hashrate(client).await.unwrap();
@@ -317,12 +323,6 @@ where
         .await
         .err()
         .unwrap()
-    ));
-    assert!(is_unimplemented(
-        EthApiClient::<Transaction, Block, Receipt>::sign_transaction(client, call_request.clone())
-            .await
-            .err()
-            .unwrap()
     ));
 }
 
@@ -368,13 +368,15 @@ where
         .unwrap_err();
     TraceApiClient::trace_call_many(client, vec![], Some(BlockNumberOrTag::Latest.into()))
         .await
-        .unwrap();
+        .unwrap_err();
     TraceApiClient::replay_transaction(client, B256::default(), HashSet::default())
         .await
         .err()
         .unwrap();
-    TraceApiClient::trace_block(client, block_id).await.unwrap();
-    TraceApiClient::replay_block_transactions(client, block_id, HashSet::default()).await.unwrap();
+    TraceApiClient::trace_block(client, block_id).await.unwrap_err();
+    TraceApiClient::replay_block_transactions(client, block_id, HashSet::default())
+        .await
+        .unwrap_err();
 
     TraceApiClient::trace_filter(client, trace_filter).await.unwrap();
 }

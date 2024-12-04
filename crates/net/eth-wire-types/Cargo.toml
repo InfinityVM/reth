@@ -16,12 +16,15 @@ workspace = true
 reth-chainspec.workspace = true
 reth-codecs-derive.workspace = true
 reth-primitives.workspace = true
+reth-primitives-traits.workspace = true
+reth-ethereum-forks.workspace = true
 
 # ethereum
 alloy-chains = { workspace = true, features = ["rlp"] }
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp = { workspace = true, features = ["derive"] }
+alloy-consensus.workspace = true
 
 bytes.workspace = true
 derive_more.workspace = true
@@ -41,14 +44,29 @@ arbitrary = { workspace = true, features = ["derive"] }
 proptest.workspace = true
 proptest-arbitrary-interop.workspace = true
 rand.workspace = true
-alloy-consensus.workspace = true
 
 [features]
 arbitrary = [
-    "reth-primitives/arbitrary",
-    "alloy-chains/arbitrary",
-    "dep:arbitrary",
-    "dep:proptest",
-    "dep:proptest-arbitrary-interop",
+	"reth-primitives/arbitrary",
+	"alloy-chains/arbitrary",
+	"dep:arbitrary",
+	"dep:proptest",
+	"dep:proptest-arbitrary-interop",
+	"reth-chainspec/arbitrary",
+	"alloy-consensus/arbitrary",
+	"alloy-eips/arbitrary",
+	"alloy-primitives/arbitrary",
+	"reth-primitives-traits/arbitrary",
+	"reth-ethereum-forks/arbitrary"
 ]
-serde = ["dep:serde"]
+serde = [
+	"dep:serde",
+	"alloy-chains/serde",
+	"alloy-consensus/serde",
+	"alloy-eips/serde",
+	"alloy-primitives/serde",
+	"bytes/serde",
+	"rand/serde",
+	"reth-primitives-traits/serde",
+	"reth-ethereum-forks/serde"
+]

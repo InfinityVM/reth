@@ -1,27 +1,19 @@
 //! `eth_` `Filter` RPC handler implementation
 
-use std::{
-    collections::HashMap,
-    fmt,
-    iter::StepBy,
-    marker::PhantomData,
-    ops::RangeInclusive,
-    sync::Arc,
-    time::{Duration, Instant},
-};
-
+use alloy_consensus::BlockHeader;
 use alloy_primitives::TxHash;
-use alloy_rpc_types::{
+use alloy_rpc_types_eth::{
     BlockNumHash, Filter, FilterBlockOption, FilterChanges, FilterId, FilteredParams, Log,
     PendingTransactionFilterKind,
 };
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, server::IdProvider};
 use reth_chainspec::ChainInfo;
-use reth_node_api::EthApiTypes;
-use reth_primitives::{Receipt, SealedBlock, TransactionSignedEcRecovered};
-use reth_provider::{BlockIdReader, BlockReader, EvmEnvProvider, ProviderError};
-use reth_rpc_eth_api::{EthFilterApiServer, FullEthApiTypes, RpcTransaction, TransactionCompat};
+use reth_primitives::{Receipt, SealedBlockWithSenders};
+use reth_provider::{BlockIdReader, BlockReader, ProviderError};
+use reth_rpc_eth_api::{
+    EthApiTypes, EthFilterApiServer, FullEthApiTypes, RpcTransaction, TransactionCompat,
+};
 use reth_rpc_eth_types::{
     logs_utils::{self, append_matching_block_logs, ProviderOrBlock},
     EthApiError, EthFilterConfig, EthStateCache, EthSubscriptionIdProvider,
@@ -30,11 +22,19 @@ use reth_rpc_server_types::{result::rpc_error_with_code, ToRpcResult};
 use reth_rpc_types_compat::transaction::from_recovered;
 use reth_tasks::TaskSpawner;
 use reth_transaction_pool::{NewSubpoolTransactionStream, PoolTransaction, TransactionPool};
+use std::{
+    collections::HashMap,
+    fmt,
+    iter::StepBy,
+    ops::RangeInclusive,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{
     sync::{mpsc::Receiver, Mutex},
     time::MissedTickBehavior,
 };
-use tracing::trace;
+use tracing::{error, trace};
 
 /// The maximum number of headers we read at once when handling a range filter.
 const MAX_HEADERS_RANGE: u64 = 1_000; // with ~530bytes per header this is ~500kb
@@ -44,7 +44,7 @@ pub struct EthFilter<Provider, Pool, Eth: EthApiTypes> {
     /// All nested fields bundled together
     inner: Arc<EthFilterInner<Provider, Pool, RpcTransaction<Eth::NetworkTypes>>>,
     /// Assembles response data w.r.t. network.
-    _tx_resp_builder: PhantomData<Eth>,
+    tx_resp_builder: Eth::TransactionCompat,
 }
 
 impl<Provider, Pool, Eth> Clone for EthFilter<Provider, Pool, Eth>
@@ -52,7 +52,7 @@ where
     Eth: EthApiTypes,
 {
     fn clone(&self) -> Self {
-        Self { inner: self.inner.clone(), _tx_resp_builder: PhantomData }
+        Self { inner: self.inner.clone(), tx_resp_builder: self.tx_resp_builder.clone() }
     }
 }
 
@@ -76,6 +76,7 @@ where
         eth_cache: EthStateCache,
         config: EthFilterConfig,
         task_spawner: Box<dyn TaskSpawner>,
+        tx_resp_builder: Eth::TransactionCompat,
     ) -> Self {
         let EthFilterConfig { max_blocks_per_filter, max_logs_per_response, stale_filter_ttl } =
             config;
@@ -93,7 +94,7 @@ where
             max_logs_per_response: max_logs_per_response.unwrap_or(usize::MAX),
         };
 
-        let eth_filter = Self { inner: Arc::new(inner), _tx_resp_builder: PhantomData };
+        let eth_filter = Self { inner: Arc::new(inner), tx_resp_builder };
 
         let this = eth_filter.clone();
         eth_filter.inner.task_spawner.spawn_critical(
@@ -143,9 +144,8 @@ where
 
 impl<Provider, Pool, Eth> EthFilter<Provider, Pool, Eth>
 where
-    Provider: BlockReader + BlockIdReader + EvmEnvProvider + 'static,
-    Pool: TransactionPool + 'static,
-    <Pool as TransactionPool>::Transaction: 'static,
+    Provider: BlockReader + BlockIdReader + 'static,
+    Pool: TransactionPool<Transaction = <Eth::Pool as TransactionPool>::Transaction> + 'static,
     Eth: FullEthApiTypes,
 {
     /// Returns all the filter changes for the given id, if any
@@ -244,8 +244,8 @@ where
 impl<Provider, Pool, Eth> EthFilterApiServer<RpcTransaction<Eth::NetworkTypes>>
     for EthFilter<Provider, Pool, Eth>
 where
-    Provider: BlockReader + BlockIdReader + EvmEnvProvider + 'static,
-    Pool: TransactionPool + 'static,
+    Provider: BlockReader + BlockIdReader + 'static,
+    Pool: TransactionPool<Transaction = <Eth::Pool as TransactionPool>::Transaction> + 'static,
     Eth: FullEthApiTypes + 'static,
 {
     /// Handler for `eth_newFilter`
@@ -278,7 +278,7 @@ where
             PendingTransactionFilterKind::Full => {
                 let stream = self.inner.pool.new_pending_pool_transactions_listener();
                 let full_txs_receiver =
-                    FullTransactionsReceiver::<_, Eth::TransactionCompat>::new(stream);
+                    FullTransactionsReceiver::new(stream, self.tx_resp_builder.clone());
                 FilterKind::PendingTransaction(PendingTransactionKind::FullTransaction(Arc::new(
                     full_txs_receiver,
                 )))
@@ -367,7 +367,7 @@ struct EthFilterInner<Provider, Pool, Tx> {
 
 impl<Provider, Pool, Tx> EthFilterInner<Provider, Pool, Tx>
 where
-    Provider: BlockReader + BlockIdReader + EvmEnvProvider + 'static,
+    Provider: BlockReader + BlockIdReader + 'static,
     Pool: TransactionPool + 'static,
 {
     /// Returns logs matching given filter object.
@@ -381,7 +381,7 @@ where
                     .header_by_hash_or_number(block_hash.into())?
                     .ok_or_else(|| ProviderError::HeaderNotFound(block_hash.into()))?;
 
-                let block_num_hash = BlockNumHash::new(header.number, block_hash);
+                let block_num_hash = BlockNumHash::new(header.number(), block_hash);
 
                 // we also need to ensure that the receipts are available and return an error if
                 // not, in case the block hash been reorged
@@ -403,7 +403,7 @@ where
                     block_num_hash,
                     &receipts,
                     false,
-                    header.timestamp,
+                    header.timestamp(),
                 )?;
 
                 Ok(all_logs)
@@ -484,20 +484,20 @@ where
 
             for (idx, header) in headers.iter().enumerate() {
                 // only if filter matches
-                if FilteredParams::matches_address(header.logs_bloom, &address_filter) &&
-                    FilteredParams::matches_topics(header.logs_bloom, &topics_filter)
+                if FilteredParams::matches_address(header.logs_bloom(), &address_filter) &&
+                    FilteredParams::matches_topics(header.logs_bloom(), &topics_filter)
                 {
                     // these are consecutive headers, so we can use the parent hash of the next
                     // block to get the current header's hash
                     let block_hash = match headers.get(idx + 1) {
-                        Some(parent) => parent.parent_hash,
+                        Some(parent) => parent.parent_hash(),
                         None => self
                             .provider
-                            .block_hash(header.number)?
-                            .ok_or_else(|| ProviderError::HeaderNotFound(header.number.into()))?,
+                            .block_hash(header.number())?
+                            .ok_or_else(|| ProviderError::HeaderNotFound(header.number().into()))?,
                     };
 
-                    let num_hash = BlockNumHash::new(header.number, block_hash);
+                    let num_hash = BlockNumHash::new(header.number(), block_hash);
                     if let Some((receipts, maybe_block)) =
                         self.receipts_and_maybe_block(&num_hash, chain_info.best_number).await?
                     {
@@ -510,16 +510,18 @@ where
                             num_hash,
                             &receipts,
                             false,
-                            header.timestamp,
+                            header.timestamp(),
                         )?;
 
                         // size check but only if range is multiple blocks, so we always return all
                         // logs of a single block
                         let is_multi_block_range = from_block != to_block;
                         if is_multi_block_range && all_logs.len() > self.max_logs_per_response {
-                            return Err(EthFilterError::QueryExceedsMaxResults(
-                                self.max_logs_per_response,
-                            ))
+                            return Err(EthFilterError::QueryExceedsMaxResults {
+                                max_logs: self.max_logs_per_response,
+                                from_block,
+                                to_block: num_hash.number.saturating_sub(1),
+                            });
                         }
                     }
                 }
@@ -534,7 +536,8 @@ where
         &self,
         block_num_hash: &BlockNumHash,
         best_number: u64,
-    ) -> Result<Option<(Arc<Vec<Receipt>>, Option<SealedBlock>)>, EthFilterError> {
+    ) -> Result<Option<(Arc<Vec<Receipt>>, Option<Arc<SealedBlockWithSenders>>)>, EthFilterError>
+    {
         // The last 4 blocks are most likely cached, so we can just fetch them
         let cached_range = best_number.saturating_sub(4)..=best_number;
         let receipts_block = if cached_range.contains(&block_num_hash.number) {
@@ -602,29 +605,34 @@ impl PendingTransactionsReceiver {
 #[derive(Debug, Clone)]
 struct FullTransactionsReceiver<T: PoolTransaction, TxCompat> {
     txs_stream: Arc<Mutex<NewSubpoolTransactionStream<T>>>,
-    _tx_resp_builder: PhantomData<TxCompat>,
+    tx_resp_builder: TxCompat,
 }
 
 impl<T, TxCompat> FullTransactionsReceiver<T, TxCompat>
 where
     T: PoolTransaction + 'static,
-    TxCompat: TransactionCompat,
+    TxCompat: TransactionCompat<T::Consensus>,
 {
     /// Creates a new `FullTransactionsReceiver` encapsulating the provided transaction stream.
-    fn new(stream: NewSubpoolTransactionStream<T>) -> Self {
-        Self { txs_stream: Arc::new(Mutex::new(stream)), _tx_resp_builder: PhantomData }
+    fn new(stream: NewSubpoolTransactionStream<T>, tx_resp_builder: TxCompat) -> Self {
+        Self { txs_stream: Arc::new(Mutex::new(stream)), tx_resp_builder }
     }
 
     /// Returns all new pending transactions received since the last poll.
-    async fn drain(&self) -> FilterChanges<TxCompat::Transaction>
-    where
-        T: PoolTransaction<Consensus: Into<TransactionSignedEcRecovered>>,
-    {
+    async fn drain(&self) -> FilterChanges<TxCompat::Transaction> {
         let mut pending_txs = Vec::new();
         let mut prepared_stream = self.txs_stream.lock().await;
 
         while let Ok(tx) = prepared_stream.try_recv() {
-            pending_txs.push(from_recovered::<TxCompat>(tx.transaction.to_recovered_transaction()))
+            match from_recovered(tx.transaction.to_consensus(), &self.tx_resp_builder) {
+                Ok(tx) => pending_txs.push(tx),
+                Err(err) => {
+                    error!(target: "rpc",
+                        %err,
+                        "Failed to fill txn with block context"
+                    );
+                }
+            }
         }
         FilterChanges::Transactions(pending_txs)
     }
@@ -640,8 +648,8 @@ trait FullTransactionsFilter<T>: fmt::Debug + Send + Sync + Unpin + 'static {
 impl<T, TxCompat> FullTransactionsFilter<TxCompat::Transaction>
     for FullTransactionsReceiver<T, TxCompat>
 where
-    T: PoolTransaction<Consensus: Into<TransactionSignedEcRecovered>> + 'static,
-    TxCompat: TransactionCompat + 'static,
+    T: PoolTransaction + 'static,
+    TxCompat: TransactionCompat<T::Consensus> + 'static,
 {
     async fn drain(&self) -> FilterChanges<TxCompat::Transaction> {
         Self::drain(self).await
@@ -715,8 +723,15 @@ pub enum EthFilterError {
     #[error("query exceeds max block range {0}")]
     QueryExceedsMaxBlocks(u64),
     /// Query result is too large.
-    #[error("query exceeds max results {0}")]
-    QueryExceedsMaxResults(usize),
+    #[error("query exceeds max results {max_logs}, retry with the range {from_block}-{to_block}")]
+    QueryExceedsMaxResults {
+        /// Maximum number of logs allowed per response
+        max_logs: usize,
+        /// Start block of the suggested retry range
+        from_block: u64,
+        /// End block of the suggested retry range (last successfully processed block)
+        to_block: u64,
+    },
     /// Error serving request in `eth_` namespace.
     #[error(transparent)]
     EthAPIError(#[from] EthApiError),
@@ -738,7 +753,7 @@ impl From<EthFilterError> for jsonrpsee::types::error::ErrorObject<'static> {
             EthFilterError::EthAPIError(err) => err.into(),
             err @ (EthFilterError::InvalidBlockRangeParams |
             EthFilterError::QueryExceedsMaxBlocks(_) |
-            EthFilterError::QueryExceedsMaxResults(_)) => {
+            EthFilterError::QueryExceedsMaxResults { .. }) => {
                 rpc_error_with_code(jsonrpsee::types::error::INVALID_PARAMS_CODE, err.to_string())
             }
         }

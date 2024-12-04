@@ -1,10 +1,9 @@
 //! [EIP-7002](https://eips.ethereum.org/EIPS/eip-7002) system call implementation.
 use crate::ConfigureEvm;
-use alloc::{boxed::Box, format, string::ToString, vec::Vec};
-use alloy_eips::eip7002::{WithdrawalRequest, WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS};
-use alloy_primitives::{bytes::Buf, Address, Bytes, FixedBytes};
+use alloc::{boxed::Box, format};
+use alloy_eips::eip7002::WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS;
+use alloy_primitives::Bytes;
 use reth_execution_errors::{BlockExecutionError, BlockValidationError};
-use reth_primitives::{Header, Request};
 use revm::{interpreter::Host, Database, Evm};
 use revm_primitives::{ExecutionResult, ResultAndState};
 
@@ -21,7 +20,7 @@ pub(crate) fn transact_withdrawal_requests_contract_call<EvmConfig, EXT, DB>(
 where
     DB: Database,
     DB::Error: core::fmt::Display,
-    EvmConfig: ConfigureEvm<Header = Header>,
+    EvmConfig: ConfigureEvm,
 {
     // get previous env
     let previous_env = Box::new(evm.context.env().clone());
@@ -62,52 +61,23 @@ where
     Ok(res)
 }
 
-/// Parses the withdrawal requests from the execution output.
+/// Calls the withdrawals requests system contract, and returns the requests from the execution
+/// output.
 #[inline]
-pub(crate) fn post_commit(result: ExecutionResult) -> Result<Vec<Request>, BlockExecutionError> {
-    let mut data = match result {
+pub(crate) fn post_commit(result: ExecutionResult) -> Result<Bytes, BlockExecutionError> {
+    match result {
         ExecutionResult::Success { output, .. } => Ok(output.into_data()),
         ExecutionResult::Revert { output, .. } => {
             Err(BlockValidationError::WithdrawalRequestsContractCall {
                 message: format!("execution reverted: {output}"),
-            })
+            }
+            .into())
         }
         ExecutionResult::Halt { reason, .. } => {
             Err(BlockValidationError::WithdrawalRequestsContractCall {
                 message: format!("execution halted: {reason:?}"),
-            })
-        }
-    }?;
-
-    // Withdrawals are encoded as a series of withdrawal requests, each with the following
-    // format:
-    //
-    // +------+--------+--------+
-    // | addr | pubkey | amount |
-    // +------+--------+--------+
-    //    20      48        8
-
-    const WITHDRAWAL_REQUEST_SIZE: usize = 20 + 48 + 8;
-    let mut withdrawal_requests = Vec::with_capacity(data.len() / WITHDRAWAL_REQUEST_SIZE);
-    while data.has_remaining() {
-        if data.remaining() < WITHDRAWAL_REQUEST_SIZE {
-            return Err(BlockValidationError::WithdrawalRequestsContractCall {
-                message: "invalid withdrawal request length".to_string(),
             }
             .into())
         }
-
-        let mut source_address = Address::ZERO;
-        data.copy_to_slice(source_address.as_mut_slice());
-
-        let mut validator_pubkey = FixedBytes::<48>::ZERO;
-        data.copy_to_slice(validator_pubkey.as_mut_slice());
-
-        let amount = data.get_u64();
-
-        withdrawal_requests
-            .push(WithdrawalRequest { source_address, validator_pubkey, amount }.into());
     }
-
-    Ok(withdrawal_requests)
 }

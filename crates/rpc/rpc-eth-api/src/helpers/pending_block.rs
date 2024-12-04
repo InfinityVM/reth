@@ -1,147 +1,150 @@
 //! Loads a pending block from database. Helper trait for `eth_` block, transaction, call and trace
 //! RPC methods.
 
-use std::time::{Duration, Instant};
-
-use crate::{EthApiTypes, FromEthApiError, FromEvmError};
-
+use super::SpawnBlocking;
+use crate::{EthApiTypes, FromEthApiError, FromEvmError, RpcNodeCore};
+use alloy_consensus::{BlockHeader, Header, EMPTY_OMMER_ROOT_HASH};
+use alloy_eips::{
+    eip4844::MAX_DATA_GAS_PER_BLOCK, eip7685::EMPTY_REQUESTS_HASH, merge::BEACON_NONCE,
+};
 use alloy_primitives::{BlockNumber, B256, U256};
-use alloy_rpc_types::BlockNumberOrTag;
+use alloy_rpc_types_eth::{BlockNumberOrTag, Withdrawals};
 use futures::Future;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_evm::{system_calls::SystemCaller, ConfigureEvm, ConfigureEvmEnv};
+use reth_errors::RethError;
+use reth_evm::{
+    state_change::post_block_withdrawals_balance_increments, system_calls::SystemCaller,
+    ConfigureEvm, ConfigureEvmEnv, NextBlockEnvAttributes,
+};
 use reth_execution_types::ExecutionOutcome;
 use reth_primitives::{
-    constants::{eip4844::MAX_DATA_GAS_PER_BLOCK, BEACON_NONCE, EMPTY_ROOT_HASH},
-    proofs::calculate_transaction_root,
-    revm_primitives::{
-        BlockEnv, CfgEnv, CfgEnvWithHandlerCfg, EVMError, Env, ExecutionResult, InvalidTransaction,
-        ResultAndState, SpecId,
-    },
-    Block, BlockBody, Header, Receipt, Requests, SealedBlockWithSenders, SealedHeader,
-    TransactionSignedEcRecovered, EMPTY_OMMER_ROOT_HASH,
+    proofs::calculate_transaction_root, Block, BlockBody, BlockExt, InvalidTransactionError,
+    Receipt, RecoveredTx, SealedBlockWithSenders,
 };
 use reth_provider::{
     BlockReader, BlockReaderIdExt, ChainSpecProvider, EvmEnvProvider, ProviderError,
-    ReceiptProvider, StateProviderFactory,
+    ProviderReceipt, ProviderTx, ReceiptProvider, StateProviderFactory,
 };
 use reth_revm::{
-    database::StateProviderDatabase, state_change::post_block_withdrawals_balance_increments,
+    database::StateProviderDatabase,
+    primitives::{
+        BlockEnv, CfgEnvWithHandlerCfg, EVMError, Env, ExecutionResult, InvalidTransaction,
+        ResultAndState, SpecId,
+    },
 };
 use reth_rpc_eth_types::{EthApiError, PendingBlock, PendingBlockEnv, PendingBlockEnvOrigin};
-use reth_transaction_pool::{BestTransactionsAttributes, TransactionPool};
-use reth_trie::HashedPostState;
+use reth_transaction_pool::{
+    error::InvalidPoolTransactionError, BestTransactionsAttributes, PoolTransaction,
+    TransactionPool,
+};
 use revm::{db::states::bundle_state::BundleRetention, DatabaseCommit, State};
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::debug;
-
-use super::SpawnBlocking;
 
 /// Loads a pending block from database.
 ///
 /// Behaviour shared by several `eth_` RPC methods, not exclusive to `eth_` blocks RPC methods.
-pub trait LoadPendingBlock: EthApiTypes {
-    /// Returns a handle for reading data from disk.
-    ///
-    /// Data access in default (L1) trait method implementations.
-    fn provider(
-        &self,
-    ) -> impl BlockReaderIdExt
-           + EvmEnvProvider
-           + ChainSpecProvider<ChainSpec: EthChainSpec + EthereumHardforks>
-           + StateProviderFactory;
-
-    /// Returns a handle for reading data from transaction pool.
-    ///
-    /// Data access in default (L1) trait method implementations.
-    fn pool(&self) -> impl TransactionPool;
-
+pub trait LoadPendingBlock:
+    EthApiTypes
+    + RpcNodeCore<
+        Provider: BlockReaderIdExt<
+            Transaction = reth_primitives::TransactionSigned,
+            Block = reth_primitives::Block,
+            Receipt = reth_primitives::Receipt,
+            Header = reth_primitives::Header,
+        > + EvmEnvProvider
+                      + ChainSpecProvider<ChainSpec: EthChainSpec + EthereumHardforks>
+                      + StateProviderFactory,
+        Pool: TransactionPool<Transaction: PoolTransaction<Consensus = ProviderTx<Self::Provider>>>,
+        Evm: ConfigureEvm<Header = Header, Transaction = ProviderTx<Self::Provider>>,
+    >
+{
     /// Returns a handle to the pending block.
     ///
     /// Data access in default (L1) trait method implementations.
     fn pending_block(&self) -> &Mutex<Option<PendingBlock>>;
 
-    /// Returns a handle for reading evm config.
-    ///
-    /// Data access in default (L1) trait method implementations.
-    fn evm_config(&self) -> &impl ConfigureEvm<Header = Header>;
-
     /// Configures the [`CfgEnvWithHandlerCfg`] and [`BlockEnv`] for the pending block
     ///
     /// If no pending block is available, this will derive it from the `latest` block
     fn pending_block_env_and_cfg(&self) -> Result<PendingBlockEnv, Self::Error> {
-        let origin: PendingBlockEnvOrigin = if let Some(pending) =
+        if let Some(block) =
             self.provider().pending_block_with_senders().map_err(Self::Error::from_eth_err)?
         {
-            PendingBlockEnvOrigin::ActualPending(pending)
-        } else {
-            // no pending block from the CL yet, so we use the latest block and modify the env
-            // values that we can
-            let latest = self
+            if let Some(receipts) = self
                 .provider()
-                .latest_header()
+                .receipts_by_block(block.hash().into())
                 .map_err(Self::Error::from_eth_err)?
-                .ok_or(EthApiError::HeaderNotFound(BlockNumberOrTag::Latest.into()))?;
+            {
+                // Note: for the PENDING block we assume it is past the known merge block and
+                // thus this will not fail when looking up the total
+                // difficulty value for the blockenv.
+                let (cfg, block_env) = self
+                    .provider()
+                    .env_with_header(block.header(), self.evm_config().clone())
+                    .map_err(Self::Error::from_eth_err)?;
 
-            let (mut latest_header, block_hash) = latest.split();
-            // child block
-            latest_header.number += 1;
-            // assumed child block is in the next slot: 12s
-            latest_header.timestamp += 12;
-            // base fee of the child block
-            let chain_spec = self.provider().chain_spec();
+                return Ok(PendingBlockEnv::new(
+                    cfg,
+                    block_env,
+                    PendingBlockEnvOrigin::ActualPending(block, receipts),
+                ));
+            }
+        }
 
-            latest_header.base_fee_per_gas = latest_header.next_block_base_fee(
-                chain_spec.base_fee_params_at_timestamp(latest_header.timestamp),
-            );
+        // no pending block from the CL yet, so we use the latest block and modify the env
+        // values that we can
+        let latest = self
+            .provider()
+            .latest_header()
+            .map_err(Self::Error::from_eth_err)?
+            .ok_or(EthApiError::HeaderNotFound(BlockNumberOrTag::Latest.into()))?;
 
-            // update excess blob gas consumed above target
-            latest_header.excess_blob_gas = latest_header.next_block_excess_blob_gas();
-
-            // we're reusing the same block hash because we need this to lookup the block's state
-            let latest = SealedHeader::new(latest_header, block_hash);
-
-            PendingBlockEnvOrigin::DerivedFromLatest(latest)
-        };
-
-        let mut cfg = CfgEnvWithHandlerCfg::new_with_spec_id(CfgEnv::default(), SpecId::LATEST);
-
-        let mut block_env = BlockEnv::default();
-        // Note: for the PENDING block we assume it is past the known merge block and thus this will
-        // not fail when looking up the total difficulty value for the blockenv.
-        self.provider()
-            .fill_env_with_header(
-                &mut cfg,
-                &mut block_env,
-                origin.header(),
-                self.evm_config().clone(),
+        let (cfg, block_env) = self
+            .evm_config()
+            .next_cfg_and_block_env(
+                &latest,
+                NextBlockEnvAttributes {
+                    timestamp: latest.timestamp() + 12,
+                    suggested_fee_recipient: latest.beneficiary(),
+                    prev_randao: B256::random(),
+                },
             )
+            .map_err(RethError::other)
             .map_err(Self::Error::from_eth_err)?;
 
-        Ok(PendingBlockEnv::new(cfg, block_env, origin))
+        Ok(PendingBlockEnv::new(
+            cfg,
+            block_env,
+            PendingBlockEnvOrigin::DerivedFromLatest(latest.hash()),
+        ))
     }
 
     /// Returns the locally built pending block
+    #[expect(clippy::type_complexity)]
     fn local_pending_block(
         &self,
-    ) -> impl Future<Output = Result<Option<(SealedBlockWithSenders, Vec<Receipt>)>, Self::Error>> + Send
+    ) -> impl Future<
+        Output = Result<
+            Option<(
+                SealedBlockWithSenders<<Self::Provider as BlockReader>::Block>,
+                Vec<ProviderReceipt<Self::Provider>>,
+            )>,
+            Self::Error,
+        >,
+    > + Send
     where
         Self: SpawnBlocking,
     {
         async move {
             let pending = self.pending_block_env_and_cfg()?;
-            if pending.origin.is_actual_pending() {
-                if let Some(block) = pending.origin.clone().into_actual_pending() {
-                    // we have the real pending block, so we should also have its receipts
-                    if let Some(receipts) = self
-                        .provider()
-                        .receipts_by_block(block.hash().into())
-                        .map_err(Self::Error::from_eth_err)?
-                    {
-                        return Ok(Some((block, receipts)))
-                    }
+            let parent_hash = match pending.origin {
+                PendingBlockEnvOrigin::ActualPending(block, receipts) => {
+                    return Ok(Some((block, receipts)));
                 }
-            }
+                PendingBlockEnvOrigin::DerivedFromLatest(parent_hash) => parent_hash,
+            };
 
             // we couldn't find the real pending block, so we need to build it ourselves
             let mut lock = self.pending_block().lock().await;
@@ -152,10 +155,10 @@ pub trait LoadPendingBlock: EthApiTypes {
             if let Some(pending_block) = lock.as_ref() {
                 // this is guaranteed to be the `latest` header
                 if pending.block_env.number.to::<u64>() == pending_block.block.number &&
-                    pending.origin.header().hash() == pending_block.block.parent_hash &&
+                    parent_hash == pending_block.block.parent_hash &&
                     now <= pending_block.expires_at
                 {
-                    return Ok(Some((pending_block.block.clone(), pending_block.receipts.clone())))
+                    return Ok(Some((pending_block.block.clone(), pending_block.receipts.clone())));
                 }
             }
 
@@ -163,7 +166,7 @@ pub trait LoadPendingBlock: EthApiTypes {
             let (sealed_block, receipts) = match self
                 .spawn_blocking_io(move |this| {
                     // we rebuild the block
-                    this.build_block(pending)
+                    this.build_block(pending.cfg, pending.block_env, parent_hash)
                 })
                 .await
             {
@@ -188,7 +191,7 @@ pub trait LoadPendingBlock: EthApiTypes {
     /// Assembles a [`Receipt`] for a transaction, based on its [`ExecutionResult`].
     fn assemble_receipt(
         &self,
-        tx: &TransactionSignedEcRecovered,
+        tx: &RecoveredTx,
         result: ExecutionResult,
         cumulative_gas_used: u64,
     ) -> Receipt {
@@ -222,14 +225,13 @@ pub trait LoadPendingBlock: EthApiTypes {
     /// block contract call using the parent beacon block root received from the CL.
     fn build_block(
         &self,
-        env: PendingBlockEnv,
+        cfg: CfgEnvWithHandlerCfg,
+        block_env: BlockEnv,
+        parent_hash: B256,
     ) -> Result<(SealedBlockWithSenders, Vec<Receipt>), Self::Error>
     where
         EthApiError: From<ProviderError>,
     {
-        let PendingBlockEnv { cfg, block_env, origin } = env;
-
-        let parent_hash = origin.build_target_hash();
         let state_provider = self
             .provider()
             .history_by_block_hash(parent_hash)
@@ -251,35 +253,16 @@ pub trait LoadPendingBlock: EthApiTypes {
                 block_env.get_blob_gasprice().map(|gasprice| gasprice as u64),
             ));
 
-        let (withdrawals, withdrawals_root) = match origin {
-            PendingBlockEnvOrigin::ActualPending(ref block) => {
-                (block.body.withdrawals.clone(), block.withdrawals_root)
-            }
-            PendingBlockEnvOrigin::DerivedFromLatest(_) => (None, None),
-        };
+        let withdrawals: Option<Withdrawals> = None;
+        let withdrawals_root = None;
 
         let chain_spec = self.provider().chain_spec();
 
-        let evm_config = self.evm_config().clone();
-        let mut system_caller = SystemCaller::new(&evm_config, chain_spec.clone());
+        let mut system_caller = SystemCaller::new(self.evm_config().clone(), chain_spec.clone());
 
-        let parent_beacon_block_root = if origin.is_actual_pending() {
-            // apply eip-4788 pre block contract call if we got the block from the CL with the real
-            // parent beacon block root
-            system_caller
-                .pre_block_beacon_root_contract_call(
-                    &mut db,
-                    &cfg,
-                    &block_env,
-                    origin.header().parent_beacon_block_root,
-                )
-                .map_err(|err| EthApiError::Internal(err.into()))?;
-            origin.header().parent_beacon_block_root
-        } else {
-            None
-        };
+        let parent_beacon_block_root = None;
         system_caller
-            .pre_block_blockhashes_contract_call(&mut db, &cfg, &block_env, origin.header().hash())
+            .pre_block_blockhashes_contract_call(&mut db, &cfg, &block_env, parent_hash)
             .map_err(|err| EthApiError::Internal(err.into()))?;
 
         let mut receipts = Vec::new();
@@ -290,7 +273,13 @@ pub trait LoadPendingBlock: EthApiTypes {
                 // we can't fit this transaction into the block, so we need to mark it as invalid
                 // which also removes all dependent transaction from the iterator before we can
                 // continue
-                best_txs.mark_invalid(&pool_tx);
+                best_txs.mark_invalid(
+                    &pool_tx,
+                    InvalidPoolTransactionError::ExceedsGasLimit(
+                        pool_tx.gas_limit(),
+                        block_gas_limit,
+                    ),
+                );
                 continue
             }
 
@@ -298,12 +287,17 @@ pub trait LoadPendingBlock: EthApiTypes {
                 // we don't want to leak any state changes made by private transactions, so we mark
                 // them as invalid here which removes all dependent transactions from the iterator
                 // before we can continue
-                best_txs.mark_invalid(&pool_tx);
+                best_txs.mark_invalid(
+                    &pool_tx,
+                    InvalidPoolTransactionError::Consensus(
+                        InvalidTransactionError::TxTypeNotSupported,
+                    ),
+                );
                 continue
             }
 
             // convert tx to a signed transaction
-            let tx = pool_tx.to_recovered_transaction();
+            let tx = pool_tx.to_consensus();
 
             // There's only limited amount of blob space available per block, so we need to check if
             // the EIP-4844 can still fit in the block
@@ -314,7 +308,13 @@ pub trait LoadPendingBlock: EthApiTypes {
                     // invalid, which removes its dependent transactions from
                     // the iterator. This is similar to the gas limit condition
                     // for regular transactions above.
-                    best_txs.mark_invalid(&pool_tx);
+                    best_txs.mark_invalid(
+                        &pool_tx,
+                        InvalidPoolTransactionError::ExceedsGasLimit(
+                            tx_blob_gas,
+                            MAX_DATA_GAS_PER_BLOCK,
+                        ),
+                    );
                     continue
                 }
             }
@@ -323,7 +323,7 @@ pub trait LoadPendingBlock: EthApiTypes {
             let env = Env::boxed(
                 cfg.cfg_env.clone(),
                 block_env.clone(),
-                Self::evm_config(self).tx_env(&tx),
+                Self::evm_config(self).tx_env(tx.as_signed(), tx.signer()),
             );
 
             let mut evm = revm::Evm::builder().with_env(env).with_db(&mut db).build();
@@ -338,7 +338,12 @@ pub trait LoadPendingBlock: EthApiTypes {
                             } else {
                                 // if the transaction is invalid, we can skip it and all of its
                                 // descendants
-                                best_txs.mark_invalid(&pool_tx);
+                                best_txs.mark_invalid(
+                                    &pool_tx,
+                                    InvalidPoolTransactionError::Consensus(
+                                        InvalidTransactionError::TxTypeNotSupported,
+                                    ),
+                                );
                             }
                             continue
                         }
@@ -398,7 +403,7 @@ pub trait LoadPendingBlock: EthApiTypes {
             block_number,
             Vec::new(),
         );
-        let hashed_state = HashedPostState::from_bundle_state(&execution_outcome.state().state);
+        let hashed_state = db.database.hashed_post_state(execution_outcome.state());
 
         let receipts_root = self.receipts_root(&block_env, &execution_outcome, block_number);
 
@@ -406,25 +411,18 @@ pub trait LoadPendingBlock: EthApiTypes {
             execution_outcome.block_logs_bloom(block_number).expect("Block is present");
 
         // calculate the state root
-        let state_provider = &db.database;
-        let state_root =
-            state_provider.state_root(hashed_state).map_err(Self::Error::from_eth_err)?;
+        let state_root = db.database.state_root(hashed_state).map_err(Self::Error::from_eth_err)?;
 
         // create the block header
         let transactions_root = calculate_transaction_root(&executed_txs);
 
         // check if cancun is activated to set eip4844 header fields correctly
         let blob_gas_used =
-            if cfg.handler_cfg.spec_id >= SpecId::CANCUN { Some(sum_blob_gas_used) } else { None };
+            (cfg.handler_cfg.spec_id >= SpecId::CANCUN).then_some(sum_blob_gas_used);
 
-        // note(onbjerg): the rpc spec has not been changed to include requests, so for now we just
-        // set these to empty
-        let (requests, requests_root) =
-            if chain_spec.is_prague_active_at_timestamp(block_env.timestamp.to::<u64>()) {
-                (Some(Requests::default()), Some(EMPTY_ROOT_HASH))
-            } else {
-                (None, None)
-            };
+        let requests_hash = chain_spec
+            .is_prague_active_at_timestamp(block_env.timestamp.to::<u64>())
+            .then_some(EMPTY_REQUESTS_HASH);
 
         let header = Header {
             parent_hash,
@@ -447,7 +445,8 @@ pub trait LoadPendingBlock: EthApiTypes {
             excess_blob_gas: block_env.get_blob_excess_gas().map(Into::into),
             extra_data: Default::default(),
             parent_beacon_block_root,
-            requests_root,
+            requests_hash,
+            target_blobs_per_block: None,
         };
 
         // Convert Vec<Option<Receipt>> to Vec<Receipt>
@@ -456,7 +455,7 @@ pub trait LoadPendingBlock: EthApiTypes {
         // seal the block
         let block = Block {
             header,
-            body: BlockBody { transactions: executed_txs, ommers: vec![], withdrawals, requests },
+            body: BlockBody { transactions: executed_txs, ommers: vec![], withdrawals },
         };
         Ok((SealedBlockWithSenders { block: block.seal_slow(), senders }, receipts))
     }

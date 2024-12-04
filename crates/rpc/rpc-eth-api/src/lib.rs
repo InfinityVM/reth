@@ -16,16 +16,19 @@ pub mod bundle;
 pub mod core;
 pub mod filter;
 pub mod helpers;
+pub mod node;
 pub mod pubsub;
 pub mod types;
-
-pub use reth_rpc_types_compat::TransactionCompat;
 
 pub use bundle::{EthBundleApiServer, EthCallBundleApiServer};
 pub use core::{EthApiServer, FullEthApiServer};
 pub use filter::EthFilterApiServer;
-pub use helpers::error::{AsEthApiError, FromEthApiError, FromEvmError, IntoEthApiError};
+pub use node::{RpcNodeCore, RpcNodeCoreExt};
 pub use pubsub::EthPubSubApiServer;
+pub use reth_rpc_eth_types::error::{
+    AsEthApiError, FromEthApiError, FromEvmError, IntoEthApiError,
+};
+pub use reth_rpc_types_compat::TransactionCompat;
 pub use types::{EthApiTypes, FullEthApiTypes, RpcBlock, RpcReceipt, RpcTransaction};
 
 #[cfg(feature = "client")]
@@ -34,3 +37,5 @@ pub use bundle::{EthBundleApiClient, EthCallBundleApiClient};
 pub use core::EthApiClient;
 #[cfg(feature = "client")]
 pub use filter::EthFilterApiClient;
+
+use reth_trie_common as _;

@@ -8,23 +8,26 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+use alloy_consensus::{Header, EMPTY_OMMER_ROOT_HASH};
 use alloy_primitives::U256;
 use reth_chainspec::{EthChainSpec, EthereumHardfork, EthereumHardforks};
-use reth_consensus::{Consensus, ConsensusError, PostExecutionInput};
+use reth_consensus::{
+    Consensus, ConsensusError, FullConsensus, HeaderValidator, PostExecutionInput,
+};
 use reth_consensus_common::validation::{
     validate_4844_header_standalone, validate_against_parent_4844,
     validate_against_parent_eip1559_base_fee, validate_against_parent_hash_number,
-    validate_against_parent_timestamp, validate_block_pre_execution, validate_header_base_fee,
-    validate_header_extradata, validate_header_gas,
+    validate_against_parent_timestamp, validate_block_pre_execution, validate_body_against_header,
+    validate_header_base_fee, validate_header_extradata, validate_header_gas,
 };
 use reth_primitives::{
-    constants::MINIMUM_GAS_LIMIT, BlockWithSenders, Header, SealedBlock, SealedHeader,
-    EMPTY_OMMER_ROOT_HASH,
+    Block, BlockBody, BlockWithSenders, NodePrimitives, Receipt, SealedBlock, SealedHeader,
 };
+use reth_primitives_traits::constants::MINIMUM_GAS_LIMIT;
 use std::{fmt::Debug, sync::Arc, time::SystemTime};
 
 /// The bound divisor of the gas limit, used in update calculations.
-const GAS_LIMIT_BOUND_DIVISOR: u64 = 1024;
+pub const GAS_LIMIT_BOUND_DIVISOR: u64 = 1024;
 
 mod validation;
 pub use validation::validate_block_post_execution;
@@ -32,7 +35,7 @@ pub use validation::validate_block_post_execution;
 /// Ethereum beacon consensus
 ///
 /// This consensus engine does basic checks as outlined in the execution specs.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EthBeaconConsensus<ChainSpec> {
     /// Configuration
     chain_spec: Arc<ChainSpec>,
@@ -91,12 +94,47 @@ impl<ChainSpec: EthChainSpec + EthereumHardforks> EthBeaconConsensus<ChainSpec> 
     }
 }
 
+impl<ChainSpec, N> FullConsensus<N> for EthBeaconConsensus<ChainSpec>
+where
+    ChainSpec: Send + Sync + EthChainSpec + EthereumHardforks + Debug,
+    N: NodePrimitives<
+        BlockHeader = Header,
+        BlockBody = BlockBody,
+        Block = Block,
+        Receipt = Receipt,
+    >,
+{
+    fn validate_block_post_execution(
+        &self,
+        block: &BlockWithSenders,
+        input: PostExecutionInput<'_>,
+    ) -> Result<(), ConsensusError> {
+        validate_block_post_execution(block, &self.chain_spec, input.receipts, input.requests)
+    }
+}
+
 impl<ChainSpec: Send + Sync + EthChainSpec + EthereumHardforks + Debug> Consensus
     for EthBeaconConsensus<ChainSpec>
 {
+    fn validate_body_against_header(
+        &self,
+        body: &BlockBody,
+        header: &SealedHeader,
+    ) -> Result<(), ConsensusError> {
+        validate_body_against_header(body, header)
+    }
+
+    fn validate_block_pre_execution(&self, block: &SealedBlock) -> Result<(), ConsensusError> {
+        validate_block_pre_execution(block, &self.chain_spec)
+    }
+}
+
+impl<ChainSpec: Send + Sync + EthChainSpec + EthereumHardforks + Debug> HeaderValidator
+    for EthBeaconConsensus<ChainSpec>
+{
     fn validate_header(&self, header: &SealedHeader) -> Result<(), ConsensusError> {
-        validate_header_gas(header)?;
-        validate_header_base_fee(header, &self.chain_spec)?;
+        validate_header_gas(header.header())?;
+        validate_header_base_fee(header.header(), &self.chain_spec)?;
 
         // EIP-4895: Beacon chain push withdrawals as operations
         if self.chain_spec.is_shanghai_active_at_timestamp(header.timestamp) &&
@@ -111,7 +149,7 @@ impl<ChainSpec: Send + Sync + EthChainSpec + EthereumHardforks + Debug> Consensu
 
         // Ensures that EIP-4844 fields are valid once cancun is active.
         if self.chain_spec.is_cancun_active_at_timestamp(header.timestamp) {
-            validate_4844_header_standalone(header)?;
+            validate_4844_header_standalone(header.header())?;
         } else if header.blob_gas_used.is_some() {
             return Err(ConsensusError::BlobGasUsedUnexpected)
         } else if header.excess_blob_gas.is_some() {
@@ -121,11 +159,11 @@ impl<ChainSpec: Send + Sync + EthChainSpec + EthereumHardforks + Debug> Consensu
         }
 
         if self.chain_spec.is_prague_active_at_timestamp(header.timestamp) {
-            if header.requests_root.is_none() {
-                return Err(ConsensusError::RequestsRootMissing)
+            if header.requests_hash.is_none() {
+                return Err(ConsensusError::RequestsHashMissing)
             }
-        } else if header.requests_root.is_some() {
-            return Err(ConsensusError::RequestsRootUnexpected)
+        } else if header.requests_hash.is_some() {
+            return Err(ConsensusError::RequestsHashUnexpected)
         }
 
         Ok(())
@@ -136,19 +174,23 @@ impl<ChainSpec: Send + Sync + EthChainSpec + EthereumHardforks + Debug> Consensu
         header: &SealedHeader,
         parent: &SealedHeader,
     ) -> Result<(), ConsensusError> {
-        validate_against_parent_hash_number(header, parent)?;
+        validate_against_parent_hash_number(header.header(), parent)?;
 
-        validate_against_parent_timestamp(header, parent)?;
+        validate_against_parent_timestamp(header.header(), parent.header())?;
 
         // TODO Check difficulty increment between parent and self
         // Ace age did increment it by some formula that we need to follow.
         self.validate_against_parent_gas_limit(header, parent)?;
 
-        validate_against_parent_eip1559_base_fee(header, parent, &self.chain_spec)?;
+        validate_against_parent_eip1559_base_fee(
+            header.header(),
+            parent.header(),
+            &self.chain_spec,
+        )?;
 
         // ensure that the blob gas fields for this block
         if self.chain_spec.is_cancun_active_at_timestamp(header.timestamp) {
-            validate_against_parent_4844(header, parent)?;
+            validate_against_parent_4844(header.header(), parent.header())?;
         }
 
         Ok(())
@@ -211,24 +253,12 @@ impl<ChainSpec: Send + Sync + EthChainSpec + EthereumHardforks + Debug> Consensu
 
         Ok(())
     }
-
-    fn validate_block_pre_execution(&self, block: &SealedBlock) -> Result<(), ConsensusError> {
-        validate_block_pre_execution(block, &self.chain_spec)
-    }
-
-    fn validate_block_post_execution(
-        &self,
-        block: &BlockWithSenders,
-        input: PostExecutionInput<'_>,
-    ) -> Result<(), ConsensusError> {
-        validate_block_post_execution(block, &self.chain_spec, input.receipts, input.requests)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Sealable, B256};
+    use alloy_primitives::B256;
     use reth_chainspec::{ChainSpec, ChainSpecBuilder};
     use reth_primitives::proofs;
 
@@ -313,16 +343,14 @@ mod tests {
         // that the header is valid
         let chain_spec = Arc::new(ChainSpecBuilder::mainnet().shanghai_activated().build());
 
-        let sealed = Header {
+        let header = Header {
             base_fee_per_gas: Some(1337),
             withdrawals_root: Some(proofs::calculate_withdrawals_root(&[])),
             ..Default::default()
-        }
-        .seal_slow();
-        let (header, seal) = sealed.into_parts();
+        };
 
         assert_eq!(
-            EthBeaconConsensus::new(chain_spec).validate_header(&SealedHeader::new(header, seal)),
+            EthBeaconConsensus::new(chain_spec).validate_header(&SealedHeader::seal(header,)),
             Ok(())
         );
     }

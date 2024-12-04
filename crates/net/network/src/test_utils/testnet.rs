@@ -1,40 +1,5 @@
 //! A network implementation for testing purposes.
 
-use std::{
-    fmt,
-    future::Future,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    pin::Pin,
-    task::{Context, Poll},
-};
-
-use futures::{FutureExt, StreamExt};
-use pin_project::pin_project;
-use reth_chainspec::{Hardforks, MAINNET};
-use reth_eth_wire::{protocol::Protocol, DisconnectReason, HelloMessageWithProtocols};
-use reth_network_api::{
-    test_utils::{PeersHandle, PeersHandleProvider},
-    NetworkEvent, NetworkEventListenerProvider, NetworkInfo, Peers,
-};
-use reth_network_peers::PeerId;
-use reth_provider::{test_utils::NoopProvider, ChainSpecProvider};
-use reth_storage_api::{BlockReader, BlockReaderIdExt, HeaderProvider, StateProviderFactory};
-use reth_tasks::TokioTaskExecutor;
-use reth_tokio_util::EventStream;
-use reth_transaction_pool::{
-    blobstore::InMemoryBlobStore,
-    test_utils::{TestPool, TestPoolBuilder},
-    EthTransactionPool, TransactionPool, TransactionValidationTaskExecutor,
-};
-use secp256k1::SecretKey;
-use tokio::{
-    sync::{
-        mpsc::{channel, unbounded_channel},
-        oneshot,
-    },
-    task::JoinHandle,
-};
-
 use crate::{
     builder::ETH_REQUEST_CHANNEL_CAPACITY,
     error::NetworkError,
@@ -42,6 +7,41 @@ use crate::{
     protocol::IntoRlpxSubProtocol,
     transactions::{TransactionsHandle, TransactionsManager, TransactionsManagerConfig},
     NetworkConfig, NetworkConfigBuilder, NetworkHandle, NetworkManager,
+};
+use futures::{FutureExt, StreamExt};
+use pin_project::pin_project;
+use reth_chainspec::{Hardforks, MAINNET};
+use reth_eth_wire::{protocol::Protocol, DisconnectReason, HelloMessageWithProtocols};
+use reth_network_api::{
+    events::{PeerEvent, SessionInfo},
+    test_utils::{PeersHandle, PeersHandleProvider},
+    NetworkEvent, NetworkEventListenerProvider, NetworkInfo, Peers,
+};
+use reth_network_peers::PeerId;
+use reth_primitives::TransactionSigned;
+use reth_provider::{test_utils::NoopProvider, ChainSpecProvider};
+use reth_storage_api::{BlockReader, BlockReaderIdExt, HeaderProvider, StateProviderFactory};
+use reth_tasks::TokioTaskExecutor;
+use reth_tokio_util::EventStream;
+use reth_transaction_pool::{
+    blobstore::InMemoryBlobStore,
+    test_utils::{TestPool, TestPoolBuilder},
+    EthTransactionPool, PoolTransaction, TransactionPool, TransactionValidationTaskExecutor,
+};
+use secp256k1::SecretKey;
+use std::{
+    fmt,
+    future::Future,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    pin::Pin,
+    task::{Context, Poll},
+};
+use tokio::{
+    sync::{
+        mpsc::{channel, unbounded_channel},
+        oneshot,
+    },
+    task::JoinHandle,
 };
 
 /// A test network consisting of multiple peers.
@@ -196,8 +196,17 @@ where
 
 impl<C, Pool> Testnet<C, Pool>
 where
-    C: BlockReader + HeaderProvider + Clone + Unpin + 'static,
-    Pool: TransactionPool + Unpin + 'static,
+    C: BlockReader<
+            Block = reth_primitives::Block,
+            Receipt = reth_primitives::Receipt,
+            Header = reth_primitives::Header,
+        > + HeaderProvider
+        + Clone
+        + Unpin
+        + 'static,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>
+        + Unpin
+        + 'static,
 {
     /// Spawns the testnet to a separate task
     pub fn spawn(self) -> TestnetHandle<C, Pool> {
@@ -255,8 +264,16 @@ impl<C, Pool> fmt::Debug for Testnet<C, Pool> {
 
 impl<C, Pool> Future for Testnet<C, Pool>
 where
-    C: BlockReader + HeaderProvider + Unpin + 'static,
-    Pool: TransactionPool + Unpin + 'static,
+    C: BlockReader<
+            Block = reth_primitives::Block,
+            Receipt = reth_primitives::Receipt,
+            Header = reth_primitives::Header,
+        > + HeaderProvider
+        + Unpin
+        + 'static,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>
+        + Unpin
+        + 'static,
 {
     type Output = ();
 
@@ -450,8 +467,16 @@ where
 
 impl<C, Pool> Future for Peer<C, Pool>
 where
-    C: BlockReader + HeaderProvider + Unpin + 'static,
-    Pool: TransactionPool + Unpin + 'static,
+    C: BlockReader<
+            Block = reth_primitives::Block,
+            Receipt = reth_primitives::Receipt,
+            Header = reth_primitives::Header,
+        > + HeaderProvider
+        + Unpin
+        + 'static,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>
+        + Unpin
+        + 'static,
 {
     type Output = ();
 
@@ -617,7 +642,9 @@ impl NetworkEventStream {
     pub async fn next_session_closed(&mut self) -> Option<(PeerId, Option<DisconnectReason>)> {
         while let Some(ev) = self.inner.next().await {
             match ev {
-                NetworkEvent::SessionClosed { peer_id, reason } => return Some((peer_id, reason)),
+                NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, reason }) => {
+                    return Some((peer_id, reason))
+                }
                 _ => continue,
             }
         }
@@ -628,7 +655,10 @@ impl NetworkEventStream {
     pub async fn next_session_established(&mut self) -> Option<PeerId> {
         while let Some(ev) = self.inner.next().await {
             match ev {
-                NetworkEvent::SessionEstablished { peer_id, .. } => return Some(peer_id),
+                NetworkEvent::ActivePeerSession { info, .. } |
+                NetworkEvent::Peer(PeerEvent::SessionEstablished(info)) => {
+                    return Some(info.peer_id)
+                }
                 _ => continue,
             }
         }
@@ -643,7 +673,7 @@ impl NetworkEventStream {
         let mut peers = Vec::with_capacity(num);
         while let Some(ev) = self.inner.next().await {
             match ev {
-                NetworkEvent::SessionEstablished { peer_id, .. } => {
+                NetworkEvent::ActivePeerSession { info: SessionInfo { peer_id, .. }, .. } => {
                     peers.push(peer_id);
                     num -= 1;
                     if num == 0 {
@@ -656,18 +686,24 @@ impl NetworkEventStream {
         peers
     }
 
-    /// Ensures that the first two events are a [`NetworkEvent::PeerAdded`] and
-    /// [`NetworkEvent::SessionEstablished`], returning the [`PeerId`] of the established
+    /// Ensures that the first two events are a [`NetworkEvent::Peer(PeerEvent::PeerAdded`] and
+    /// [`NetworkEvent::ActivePeerSession`], returning the [`PeerId`] of the established
     /// session.
     pub async fn peer_added_and_established(&mut self) -> Option<PeerId> {
         let peer_id = match self.inner.next().await {
-            Some(NetworkEvent::PeerAdded(peer_id)) => peer_id,
+            Some(NetworkEvent::Peer(PeerEvent::PeerAdded(peer_id))) => peer_id,
             _ => return None,
         };
 
         match self.inner.next().await {
-            Some(NetworkEvent::SessionEstablished { peer_id: peer_id2, .. }) => {
-                debug_assert_eq!(peer_id, peer_id2, "PeerAdded peer_id {peer_id} does not match SessionEstablished peer_id {peer_id2}");
+            Some(NetworkEvent::ActivePeerSession {
+                info: SessionInfo { peer_id: peer_id2, .. },
+                ..
+            }) => {
+                debug_assert_eq!(
+                    peer_id, peer_id2,
+                    "PeerAdded peer_id {peer_id} does not match SessionEstablished peer_id {peer_id2}"
+                );
                 Some(peer_id)
             }
             _ => None,

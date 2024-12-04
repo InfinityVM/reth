@@ -1,4 +1,10 @@
 //! Traits for configuring an EVM specifics.
+//!
+//! # Revm features
+//!
+//! This crate does __not__ enforce specific revm features such as `blst` or `c-kzg`, which are
+//! critical for revm's evm internals, it is the responsibility of the implementer to ensure the
+//! proper features are selected.
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
@@ -11,11 +17,9 @@
 
 extern crate alloc;
 
-use core::ops::Deref;
-
 use crate::builder::RethEvmBuilder;
+use alloy_consensus::BlockHeader as _;
 use alloy_primitives::{Address, Bytes, B256, U256};
-use reth_primitives::{TransactionSigned, TransactionSignedEcRecovered};
 use reth_primitives_traits::BlockHeader;
 use revm::{Database, Evm, GetInspector};
 use revm_primitives::{BlockEnv, CfgEnvWithHandlerCfg, Env, EnvWithHandlerCfg, SpecId, TxEnv};
@@ -27,8 +31,8 @@ pub mod execute;
 pub mod metrics;
 pub mod noop;
 pub mod provider;
+pub mod state_change;
 pub mod system_calls;
-
 #[cfg(any(test, feature = "test-utils"))]
 /// test helpers for mocking executor
 pub mod test_utils;
@@ -111,15 +115,21 @@ pub trait ConfigureEvmEnv: Send + Sync + Unpin + Clone + 'static {
     /// The header type used by the EVM.
     type Header: BlockHeader;
 
-    /// Returns a [`TxEnv`] from a [`TransactionSignedEcRecovered`].
-    fn tx_env(&self, transaction: &TransactionSignedEcRecovered) -> TxEnv {
+    /// The transaction type.
+    type Transaction;
+
+    /// The error type that is returned by [`Self::next_cfg_and_block_env`].
+    type Error: core::error::Error + Send + Sync;
+
+    /// Returns a [`TxEnv`] from a transaction and [`Address`].
+    fn tx_env(&self, transaction: &Self::Transaction, signer: Address) -> TxEnv {
         let mut tx_env = TxEnv::default();
-        self.fill_tx_env(&mut tx_env, transaction.deref(), transaction.signer());
+        self.fill_tx_env(&mut tx_env, transaction, signer);
         tx_env
     }
 
-    /// Fill transaction environment from a [`TransactionSigned`] and the given sender address.
-    fn fill_tx_env(&self, tx_env: &mut TxEnv, transaction: &TransactionSigned, sender: Address);
+    /// Fill transaction environment from a transaction  and the given sender address.
+    fn fill_tx_env(&self, tx_env: &mut TxEnv, transaction: &Self::Transaction, sender: Address);
 
     /// Fill transaction environment with a system contract call.
     fn fill_tx_env_system_contract_call(
@@ -130,9 +140,16 @@ pub trait ConfigureEvmEnv: Send + Sync + Unpin + Clone + 'static {
         data: Bytes,
     );
 
+    /// Returns a [`CfgEnvWithHandlerCfg`] for the given header.
+    fn cfg_env(&self, header: &Self::Header, total_difficulty: U256) -> CfgEnvWithHandlerCfg {
+        let mut cfg = CfgEnvWithHandlerCfg::new(Default::default(), Default::default());
+        self.fill_cfg_env(&mut cfg, header, total_difficulty);
+        cfg
+    }
+
     /// Fill [`CfgEnvWithHandlerCfg`] fields according to the chain spec and given header.
     ///
-    /// This must set the corresponding spec id in the handler cfg, based on timestamp or total
+    /// This __must__ set the corresponding spec id in the handler cfg, based on timestamp or total
     /// difficulty
     fn fill_cfg_env(
         &self,
@@ -147,7 +164,7 @@ pub trait ConfigureEvmEnv: Send + Sync + Unpin + Clone + 'static {
         block_env.coinbase = header.beneficiary();
         block_env.timestamp = U256::from(header.timestamp());
         if after_merge {
-            block_env.prevrandao = Some(header.mix_hash());
+            block_env.prevrandao = header.mix_hash();
             block_env.difficulty = U256::ZERO;
         } else {
             block_env.difficulty = header.difficulty();
@@ -160,6 +177,18 @@ pub trait ConfigureEvmEnv: Send + Sync + Unpin + Clone + 'static {
         if let Some(excess_blob_gas) = header.excess_blob_gas() {
             block_env.set_blob_excess_gas_and_price(excess_blob_gas);
         }
+    }
+
+    /// Creates a new [`CfgEnvWithHandlerCfg`] and [`BlockEnv`] for the given header.
+    fn cfg_and_block_env(
+        &self,
+        header: &Self::Header,
+        total_difficulty: U256,
+    ) -> (CfgEnvWithHandlerCfg, BlockEnv) {
+        let mut cfg = CfgEnvWithHandlerCfg::new(Default::default(), Default::default());
+        let mut block_env = BlockEnv::default();
+        self.fill_cfg_and_block_env(&mut cfg, &mut block_env, header, total_difficulty);
+        (cfg, block_env)
     }
 
     /// Convenience function to call both [`fill_cfg_env`](ConfigureEvmEnv::fill_cfg_env) and
@@ -187,7 +216,7 @@ pub trait ConfigureEvmEnv: Send + Sync + Unpin + Clone + 'static {
         &self,
         parent: &Self::Header,
         attributes: NextBlockEnvAttributes,
-    ) -> (CfgEnvWithHandlerCfg, BlockEnv);
+    ) -> Result<(CfgEnvWithHandlerCfg, BlockEnv), Self::Error>;
 }
 
 /// Represents additional attributes required to configure the next block.
@@ -202,4 +231,19 @@ pub struct NextBlockEnvAttributes {
     pub suggested_fee_recipient: Address,
     /// The randomness value for the next block.
     pub prev_randao: B256,
+}
+
+/// Function hook that allows to modify a transaction environment.
+pub trait TxEnvOverrides {
+    /// Apply the overrides by modifying the given `TxEnv`.
+    fn apply(&mut self, env: &mut TxEnv);
+}
+
+impl<F> TxEnvOverrides for F
+where
+    F: FnMut(&mut TxEnv),
+{
+    fn apply(&mut self, env: &mut TxEnv) {
+        self(env)
+    }
 }
