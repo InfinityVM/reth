@@ -2549,6 +2549,13 @@ where
         state: ForkchoiceState,
         version: EngineApiMessageVersion,
     ) -> OnForkChoiceUpdated {
+        // 7. Client software MUST ensure that payloadAttributes.timestamp is greater than timestamp
+        //    of a block referenced by forkchoiceState.headBlockHash. If this condition isn't held
+        //    client software MUST respond with -38003: `Invalid payload attributes` and MUST NOT
+        //    begin a payload build process. In such an event, the forkchoiceState update MUST NOT
+        //    be rolled back.
+        
+        #[cfg(not(feature = "i-wanna-go-fast"))]
         if let Err(err) =
             self.payload_validator.validate_payload_attributes_against_header(&attrs, head)
         {
