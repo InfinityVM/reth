@@ -277,13 +277,14 @@ where
             // return balance to DAO beneficiary.
             *balance_increments.entry(DAO_HARDFORK_BENEFICIARY).or_default() += drained_balance;
         }
+
         // increment balances
-        // self.state
-        //     .increment_balances(balance_increments.clone())
-        //     .map_err(|_| BlockValidationError::IncrementBalanceFailed)?;
-        // // call state hook with changes due to balance increments.
-        // let balance_state = balance_increment_state(&balance_increments, &mut self.state)?;
-        // self.system_caller.on_state(&balance_state);
+        self.state
+            .increment_balances(balance_increments.clone())
+            .map_err(|_| BlockValidationError::IncrementBalanceFailed)?;
+        // call state hook with changes due to balance increments.
+        let balance_state = balance_increment_state(&balance_increments, &mut self.state)?;
+        self.system_caller.on_state(&balance_state);
 
         Ok(requests)
     }

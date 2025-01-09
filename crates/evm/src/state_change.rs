@@ -47,8 +47,7 @@ where
         &mut balance_increments,
     );
 
-    // balance_increments
-    HashMap::default()
+    balance_increments
 }
 
 /// Returns a map of addresses to their balance increments if the Shanghai hardfork is active at the
