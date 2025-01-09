@@ -156,7 +156,7 @@ where
         let env = self.evm_env_for_block(&block.header);
         let mut evm = self.evm_config.evm_with_env(&mut self.state, env);
 
-        // self.system_caller.apply_pre_execution_changes(&block.block, &mut evm)?;
+        self.system_caller.apply_pre_execution_changes(&block.block, &mut evm)?;
 
         Ok(())
     }
@@ -231,8 +231,8 @@ where
                 },
             );
         }
-        dbg!("receipts", &receipts);
-        dbg!("cumulative_gas_used");
+        dbg!(&receipts);
+        dbg!(cumulative_gas_used);
         Ok(ExecuteOutput { receipts, gas_used: cumulative_gas_used })
     }
 
