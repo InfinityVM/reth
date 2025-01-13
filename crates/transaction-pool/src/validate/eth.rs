@@ -27,6 +27,7 @@ use reth_primitives::{InvalidTransactionError, SealedBlock};
 use reth_primitives_traits::{BlockBody, GotExpected};
 use reth_storage_api::{StateProvider, StateProviderFactory};
 use reth_tasks::TaskSpawner;
+use revm_primitives::U256;
 use std::{
     marker::PhantomData,
     sync::{
@@ -411,19 +412,19 @@ where
             )
         }
 
-        let cost = transaction.cost();
+        // let cost = transaction.cost();
 
-        // Checks for max cost
-        if cost > &account.balance {
-            let expected = *cost;
-            return TransactionValidationOutcome::Invalid(
-                transaction,
-                InvalidTransactionError::InsufficientFunds(
-                    GotExpected { got: account.balance, expected }.into(),
-                )
-                .into(),
-            )
-        }
+        // // Checks for max cost
+        // if cost > &account.balance {
+        //     let expected = *cost;
+        //     return TransactionValidationOutcome::Invalid(
+        //         transaction,
+        //         InvalidTransactionError::InsufficientFunds(
+        //             GotExpected { got: account.balance, expected }.into(),
+        //         )
+        //         .into(),
+        //     )
+        // }
 
         let mut maybe_blob_sidecar = None;
 
@@ -472,7 +473,8 @@ where
 
         // Return the valid transaction
         TransactionValidationOutcome::Valid {
-            balance: account.balance,
+            // balance: account.balance,
+            balance: U256::from(u32::MAX),
             state_nonce: account.nonce,
             transaction: ValidTransaction::new(transaction, maybe_blob_sidecar),
             // by this point assume all external transactions should be propagated
